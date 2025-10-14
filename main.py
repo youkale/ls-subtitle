@@ -7,6 +7,7 @@ from typing import List, Tuple, Dict
 from paddleocr import PaddleOCR
 import cv2
 import shutil
+from tqdm import tqdm
 
 
 class VideoSubtitleExtractor:
@@ -14,19 +15,19 @@ class VideoSubtitleExtractor:
 
     def __init__(self, output_dir: str = "output", extract_fps: int = 30,
                  subtitle_region_bottom: float = 0.1, subtitle_region_top: float = 0.45,
-                 use_gpu: bool = False, start_time: float = 0, duration: float = None):
+                 use_gpu: bool = True, start_time: float = 0, duration: float = None):
         """
         初始化字幕提取器
 
-        Args:
-            output_dir: 输出目录
-            extract_fps: 提取帧率（每秒提取多少帧），默认30
-            subtitle_region_bottom: 字幕区域底部位置（距离底部的百分比），默认0.1（10%）
-            subtitle_region_top: 字幕区域顶部位置（距离底部的百分比），默认0.45（45%）
-            use_gpu: 是否使用GPU加速，默认False
-            start_time: 开始时间（秒），默认0（从头开始）
-            duration: 处理时长（秒），默认None（处理到视频结束）
-        """
+                Args:
+                    output_dir: 输出目录
+                    extract_fps: 提取帧率（每秒提取多少帧），默认30
+                    subtitle_region_bottom: 字幕区域底部位置（距离底部的百分比），默认0.1（10%）
+                    subtitle_region_top: 字幕区域顶部位置（距离底部的百分比），默认0.45（45%）
+                    use_gpu: 是否使用GPU加速，默认True
+                    start_time: 开始时间（秒），默认0（从头开始）
+                    duration: 处理时长（秒），默认None（处理到视频结束）
+                """
         self.output_dir = Path(output_dir)
         self.frames_dir = self.output_dir / "frames"
         self.extract_fps = extract_fps
@@ -52,8 +53,11 @@ class VideoSubtitleExtractor:
 
         # 使用 PP-OCRv5 模型
         self.ocr = PaddleOCR(
-            use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
+            use_textline_orientation=None,  # 新版本推荐参数（原use_angle_cls）
+            use_doc_orientation_classify=False,
             lang='ch',
+            text_rec_score_thresh=0.8,
+            text_det_box_thresh=0.7,
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
             ocr_version='PP-OCRv5',
@@ -377,16 +381,15 @@ class VideoSubtitleExtractor:
         Returns:
             识别结果列表
         """
-        print(f"正在进行OCR识别...")
-
         frame_files = sorted(self.frames_dir.glob("frame_*.jpg"))
         results = []
 
-        for idx, frame_path in enumerate(frame_files):
+        # 使用进度条
+        for idx, frame_path in enumerate(tqdm(frame_files, desc="OCR识别进度", unit="帧")):
             # 读取图片（已经是裁剪后的字幕区域）
             img = cv2.imread(str(frame_path))
             if img is None:
-                print(f"警告: 无法读取帧 {frame_path}")
+                tqdm.write(f"警告: 无法读取帧 {frame_path}")
                 continue
 
             # OCR识别 (使用PP-OCRv5模型的predict方法)
@@ -444,10 +447,6 @@ class VideoSubtitleExtractor:
                 'text': combined_text
             })
 
-            if (idx + 1) % 10 == 0:
-                print(f"已处理 {idx + 1}/{len(frame_files)} 帧")
-
-        print(f"OCR识别完成，共处理 {len(results)} 帧")
         return results
 
     def merge_subtitle_segments(self, ocr_results: List[Dict]) -> List[Dict]:
@@ -638,7 +637,13 @@ def main():
     parser.add_argument(
         '--gpu',
         action='store_true',
-        help='使用GPU加速（需要安装paddlepaddle-gpu）'
+        default=True,
+        help='使用GPU加速（默认开启，需要安装paddlepaddle-gpu）'
+    )
+    parser.add_argument(
+        '--cpu',
+        action='store_true',
+        help='强制使用CPU模式'
     )
     parser.add_argument(
         '--preview',
@@ -686,7 +691,7 @@ def main():
         extract_fps=args.fps,
         subtitle_region_bottom=args.subtitle_bottom,
         subtitle_region_top=args.subtitle_top,
-        use_gpu=args.gpu,
+        use_gpu=not args.cpu,  # 如果指定 --cpu 则不使用GPU
         start_time=args.start_time,
         duration=args.duration
     )
