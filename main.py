@@ -8,6 +8,39 @@ from paddleocr import PaddleOCR
 import cv2
 import shutil
 from tqdm import tqdm
+import numpy as np
+
+
+def get_groups_mean(arr: list, tolerance: float = 20) -> float:
+    """
+    计算分组后的平均值。
+    对给定数组进行分组，每组内的元素与组内最小元素的差值不大于tolerance。
+    然后计算最大组的平均值作为结果。
+
+    Args:
+        arr: 输入的数字列表
+        tolerance: 分组的差值容忍度，默认为20
+
+    Returns:
+        最大组的平均值
+    """
+    if not arr:
+        return 0
+
+    arr_sorted = sorted(arr)
+    groups = []
+    current_group = [arr_sorted[0]]
+
+    for i in range(1, len(arr_sorted)):
+        if abs(arr_sorted[i] - current_group[0]) <= tolerance:
+            current_group.append(arr_sorted[i])
+        else:
+            groups.append(current_group)
+            current_group = [arr_sorted[i]]
+
+    groups.append(current_group)
+    max_group = max(groups, key=len)
+    return np.mean(max_group)
 
 
 class VideoSubtitleExtractor:
@@ -373,15 +406,15 @@ class VideoSubtitleExtractor:
             print(f"  字幕区域: y={bottom_y} 到 y={top_y} (高度={top_y-bottom_y}px)")
             print(f"  占比: 底部{self.subtitle_region_bottom*100:.0f}% 到 {self.subtitle_region_top*100:.0f}%")
 
-    def ocr_frames(self) -> List[Dict]:
+    def ocr_frames(self) -> Dict[str, Dict]:
         """
         对所有帧进行OCR识别（帧已经是裁剪后的字幕区域）
 
         Returns:
-            识别结果列表
+            识别结果字典，key为帧路径，value包含文本、边界框、置信度等信息
         """
         frame_files = sorted(self.frames_dir.glob("frame_*.jpg"))
-        results = []
+        results = {}
 
         # 使用进度条
         for idx, frame_path in enumerate(tqdm(frame_files, desc="OCR识别进度", unit="帧")):
@@ -392,113 +425,252 @@ class VideoSubtitleExtractor:
                 continue
 
             # OCR识别 (使用PP-OCRv5模型的predict方法)
-            # 现在图片已经是字幕区域了，不需要再次裁剪
             ocr_result = self.ocr.predict(img, use_textline_orientation=True)
 
-            # 提取文本
-            text_lines = []
+            # 提取文本和边界框信息
+            text_items = []  # 存储每个文本项的信息
+
             if ocr_result and len(ocr_result) > 0:
-                # PaddleOCR 3.2.0 predict() 返回 OCRResult 对象（类字典）
                 for item in ocr_result:
-                    # OCRResult 是类字典对象，使用字典方式访问
                     if hasattr(item, 'get'):
-                        # 尝试获取 rec_texts 和 rec_scores（复数形式）
+                        # 获取检测框
+                        dt_polys = item.get('dt_polys')  # 检测框坐标
                         texts = item.get('rec_texts')
                         scores = item.get('rec_scores')
 
-                        if texts and scores:
-                            for text, score in zip(texts, scores):
+                        if texts and scores and dt_polys:
+                            for text, score, poly in zip(texts, scores, dt_polys):
                                 if score > 0.5 and text.strip():
-                                    text_lines.append(text)
-                        else:
-                            # 尝试单数形式
-                            text = item.get('rec_text', '')
-                            confidence = item.get('rec_score', 0.0)
-                            if confidence > 0.5 and text.strip():
-                                text_lines.append(text)
+                                    # 计算边界框 (xmin, ymin, xmax, ymax)
+                                    x_coords = [p[0] for p in poly]
+                                    y_coords = [p[1] for p in poly]
+                                    xmin = int(min(x_coords))
+                                    xmax = int(max(x_coords))
+                                    ymin = int(min(y_coords))
+                                    ymax = int(max(y_coords))
 
-                    # 兼容普通字典格式
-                    elif isinstance(item, dict):
-                        text = item.get('rec_text', '')
-                        confidence = item.get('rec_score', 0.0)
-                        if confidence > 0.5 and text.strip():
-                            text_lines.append(text)
+                                    text_items.append({
+                                        'text': text,
+                                        'score': float(score),
+                                        'box': [xmin, ymin, xmax, ymax]
+                                    })
 
-                    # 兼容列表格式 (旧版本API)
-                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                        if isinstance(item[1], (list, tuple)) and len(item[1]) >= 2:
-                            text = item[1][0]
-                            confidence = item[1][1]
-                            if confidence > 0.5 and text.strip():
-                                text_lines.append(text)
+            # 如果有识别结果，保存到字典中
+            if text_items:
+                # 按 x 坐标排序（从左到右）
+                text_items.sort(key=lambda x: x['box'][0])
 
-            combined_text = " ".join(text_lines)
+                # 合并同一行的文本
+                combined_text = ' '.join([item['text'] for item in text_items])
 
-            # 计算实际时间戳（根据提取帧率）
-            timestamp = idx / self.extract_fps
+                # 计算整体边界框
+                if text_items:
+                    all_boxes = [item['box'] for item in text_items]
+                    xmin = min(box[0] for box in all_boxes)
+                    ymin = min(box[1] for box in all_boxes)
+                    xmax = max(box[2] for box in all_boxes)
+                    ymax = max(box[3] for box in all_boxes)
 
-            # 调整时间戳，考虑开始时间偏移
-            adjusted_timestamp = timestamp + self.start_time
-
-            results.append({
-                'frame_index': idx + 1,
-                'timestamp': adjusted_timestamp,
-                'text': combined_text
-            })
+                    results[str(frame_path)] = {
+                        'text': combined_text,
+                        'box': [xmin, ymin, xmax, ymax],
+                        'frame_index': idx,
+                        'items': text_items  # 保留原始文本项
+                    }
 
         return results
 
-    def merge_subtitle_segments(self, ocr_results: List[Dict]) -> List[Dict]:
+    def check_ocr_result(self, ocr_result: Dict[str, Dict], video_info: Dict) -> Dict[str, Dict]:
+        """
+        校验并整合OCR识别结果
+
+        参考: https://github.com/chenwr727/SubErase-Translate-Embed
+
+        主要功能：
+        1. 统计字幕的中心位置和高度
+        2. 过滤掉不在字幕区域的文本
+        3. 合并同一帧内相邻的文本
+        4. 填充连续帧之间的空白
+
+        Args:
+            ocr_result: OCR识别结果字典
+            video_info: 视频信息（包含分辨率）
+
+        Returns:
+            校验和整合后的OCR结果
+        """
+        if not ocr_result:
+            return {}
+
+        # 获取图像尺寸（从裁剪后的帧）
+        first_frame = next(iter(ocr_result.keys()))
+        img = cv2.imread(first_frame)
+        if img is None:
+            return ocr_result
+
+        img_height, img_width = img.shape[:2]
+
+        # 配置参数
+        width_delta = img_width * 0.3   # 水平位置容忍度（30%）
+        height_delta = img_height * 0.1  # 垂直位置容忍度（10%）
+        groups_tolerance = img_height * 0.05  # 分组容忍度（5%）
+
+        x_center_frame = img_width / 2
+
+        # 第一步：统计字幕的中心位置和高度
+        center_list = []
+        word_height_list = []
+
+        for frame_path, value in tqdm(ocr_result.items(), desc="统计字幕位置", unit="帧"):
+            xmin, ymin, xmax, ymax = value['box']
+            x_center = (xmin + xmax) / 2
+            y_center = (ymin + ymax) / 2
+
+            # 只统计靠近水平中心的文本
+            if x_center - width_delta < x_center_frame < x_center + width_delta:
+                center_list.append(y_center)
+                word_height_list.append(ymax - ymin)
+
+        if not center_list:
+            return ocr_result
+
+        # 使用分组统计找到最常见的字幕位置和高度
+        center = get_groups_mean(center_list, groups_tolerance)
+        word_height = get_groups_mean(word_height_list, groups_tolerance)
+
+        print(f"  检测到字幕中心位置: y={center:.0f}px (容忍±{height_delta:.0f}px)")
+        print(f"  检测到字幕平均高度: {word_height:.0f}px")
+
+        # 第二步：过滤并合并同一帧内的文本
+        filtered_result = {}
+
+        for frame_path, value in tqdm(ocr_result.items(), desc="过滤OCR结果", unit="帧"):
+            xmin, ymin, xmax, ymax = value['box']
+            y_center = (ymin + ymax) / 2
+            x_center = (xmin + xmax) / 2
+            text_height = ymax - ymin
+
+            # 检查是否在字幕区域内
+            if (center - height_delta < y_center < center + height_delta and
+                word_height - groups_tolerance <= text_height <= word_height + groups_tolerance):
+
+                # 检查多个文本项，看是否需要进一步合并
+                if 'items' in value and len(value['items']) > 1:
+                    # 合并相邻的文本项
+                    merged_text = value['text']
+                    merged_box = value['box']
+                else:
+                    merged_text = value['text']
+                    merged_box = value['box']
+
+                filtered_result[frame_path] = {
+                    'text': merged_text,
+                    'box': merged_box,
+                    'frame_index': value['frame_index']
+                }
+
+        # 第三步：填充连续帧之间的空白
+        if not filtered_result:
+            return {}
+
+        # 按帧索引排序
+        sorted_frames = sorted(filtered_result.items(), key=lambda x: x[1]['frame_index'])
+
+        final_result = {}
+        min_duration_frames = int(self.extract_fps * 0.3)  # 最小持续时间0.3秒
+
+        for i in range(len(sorted_frames)):
+            frame_path, value = sorted_frames[i]
+            frame_idx = value['frame_index']
+            text = value['text']
+
+            final_result[frame_path] = value
+
+            # 如果不是最后一帧，检查是否需要填充
+            if i < len(sorted_frames) - 1:
+                next_frame_path, next_value = sorted_frames[i + 1]
+                next_frame_idx = next_value['frame_index']
+                next_text = next_value['text']
+
+                # 如果文本相同且帧间隔不大，填充中间的帧
+                if text == next_text and (next_frame_idx - frame_idx) <= min_duration_frames:
+                    # 填充中间的帧
+                    for fill_idx in range(frame_idx + 1, next_frame_idx):
+                        fill_frame_name = f"frame_{fill_idx:06d}.jpg"
+                        fill_frame_path = str(self.frames_dir / fill_frame_name)
+
+                        if os.path.exists(fill_frame_path):
+                            final_result[fill_frame_path] = {
+                                'text': text,
+                                'box': value['box'],
+                                'frame_index': fill_idx
+                            }
+
+        print(f"  过滤前: {len(ocr_result)} 帧，过滤后: {len(filtered_result)} 帧，填充后: {len(final_result)} 帧")
+
+        return final_result
+
+    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict]) -> List[Dict]:
         """
         合并连续相同的字幕段
 
         Args:
-            ocr_results: OCR识别结果
+            ocr_results: OCR识别结果字典
 
         Returns:
-            合并后的字幕段
+            合并后的字幕段列表
         """
-        print("正在合并字幕段...")
-
         if not ocr_results:
             return []
 
+        print("正在合并字幕段...")
+
+        # 按帧索引排序
+        sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
+
         segments = []
-        current_segment = None
+        current_text = None
+        start_frame_idx = None
+        end_frame_idx = None
         frame_duration = 1.0 / self.extract_fps  # 每帧的时长
 
-        for result in ocr_results:
-            text = result['text'].strip()
+        for frame_path, value in sorted_results:
+            text = value['text'].strip()
+            frame_idx = value['frame_index']
 
-            # 跳过空文本
             if not text:
-                if current_segment:
-                    segments.append(current_segment)
-                    current_segment = None
                 continue
 
-            # 如果是新字幕段
-            if current_segment is None:
-                current_segment = {
-                    'start_time': result['timestamp'],
-                    'end_time': result['timestamp'] + frame_duration,
-                    'text': text
-                }
-            # 如果文本相同，扩展当前段
-            elif text == current_segment['text']:
-                current_segment['end_time'] = result['timestamp'] + frame_duration
-            # 如果文本不同，保存当前段并开始新段
+            if text == current_text:
+                # 相同文本，延长结束帧
+                end_frame_idx = frame_idx
             else:
-                segments.append(current_segment)
-                current_segment = {
-                    'start_time': result['timestamp'],
-                    'end_time': result['timestamp'] + frame_duration,
-                    'text': text
-                }
+                # 新文本，保存之前的段
+                if current_text:
+                    start_time = start_frame_idx / self.extract_fps + self.start_time
+                    end_time = (end_frame_idx + 1) / self.extract_fps + self.start_time
 
-        # 添加最后一段
-        if current_segment:
-            segments.append(current_segment)
+                    segments.append({
+                        'text': current_text,
+                        'start_time': start_time,
+                        'end_time': end_time
+                    })
+
+                # 开始新段
+                current_text = text
+                start_frame_idx = frame_idx
+                end_frame_idx = frame_idx
+
+        # 保存最后一段
+        if current_text:
+            start_time = start_frame_idx / self.extract_fps + self.start_time
+            end_time = (end_frame_idx + 1) / self.extract_fps + self.start_time
+
+            segments.append({
+                'text': current_text,
+                'start_time': start_time,
+                'end_time': end_time
+            })
 
         print(f"合并后得到 {len(segments)} 个字幕段")
         return segments
@@ -576,10 +748,14 @@ class VideoSubtitleExtractor:
             # 步骤3: OCR识别
             ocr_results = self.ocr_frames()
 
-            # 步骤4: 合并字幕段
+            # 步骤4: 检查和优化OCR结果
+            print("正在检查OCR结果...")
+            ocr_results = self.check_ocr_result(ocr_results, video_info)
+
+            # 步骤5: 合并字幕段
             segments = self.merge_subtitle_segments(ocr_results)
 
-            # 步骤5: 生成SRT文件
+            # 步骤6: 生成SRT文件
             self.generate_srt(segments, str(output_srt_path))
 
             print(f"\n处理完成！")
