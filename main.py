@@ -53,8 +53,7 @@ class VideoSubtitleExtractor:
 
         # 使用 PP-OCRv5 模型
         self.ocr = PaddleOCR(
-            use_textline_orientation=None,  # 新版本推荐参数（原use_angle_cls）
-            use_doc_orientation_classify=False,
+            use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
             text_rec_score_thresh=0.8,
             text_det_box_thresh=0.7,
