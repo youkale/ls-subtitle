@@ -9,6 +9,7 @@ import cv2
 import shutil
 from tqdm import tqdm
 import numpy as np
+from difflib import SequenceMatcher
 
 
 def get_groups_mean(arr: list, tolerance: float = 20) -> float:
@@ -41,6 +42,24 @@ def get_groups_mean(arr: list, tolerance: float = 20) -> float:
     groups.append(current_group)
     max_group = max(groups, key=len)
     return np.mean(max_group)
+
+
+def text_similarity(text1: str, text2: str) -> float:
+    """
+    计算两个文本的相似度
+
+    Args:
+        text1: 第一个文本
+        text2: 第二个文本
+
+    Returns:
+        相似度分数 (0.0 到 1.0)
+    """
+    if not text1 or not text2:
+        return 0.0
+
+    # 使用 SequenceMatcher 计算相似度
+    return SequenceMatcher(None, text1, text2).ratio()
 
 
 class VideoSubtitleExtractor:
@@ -88,7 +107,7 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.8,
+            text_rec_score_thresh=0.9,
             text_det_box_thresh=0.7,
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
@@ -610,12 +629,16 @@ class VideoSubtitleExtractor:
 
         return final_result
 
-    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict]) -> List[Dict]:
+    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8) -> List[Dict]:
         """
-        合并连续相同的字幕段
+        合并连续相同或相似的字幕段
+
+        使用文本相似度算法（而不是精确匹配）来合并字幕，
+        可以处理 OCR 识别误差导致的同一句话被分割的问题。
 
         Args:
             ocr_results: OCR识别结果字典
+            similarity_threshold: 文本相似度阈值（0.0-1.0），默认0.8
 
         Returns:
             合并后的字幕段列表
@@ -623,56 +646,87 @@ class VideoSubtitleExtractor:
         if not ocr_results:
             return []
 
-        print("正在合并字幕段...")
+        print("正在合并字幕段（使用相似度匹配）...")
 
         # 按帧索引排序
         sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
 
         segments = []
-        current_text = None
-        start_frame_idx = None
-        end_frame_idx = None
-        frame_duration = 1.0 / self.extract_fps  # 每帧的时长
+        current_segment = None
+        text_variants = []  # 存储当前段的所有文本变体
 
         for frame_path, value in sorted_results:
             text = value['text'].strip()
             frame_idx = value['frame_index']
 
             if not text:
+                # 空文本，结束当前段
+                if current_segment:
+                    # 选择出现次数最多的文本作为最终文本
+                    final_text = max(set(text_variants), key=text_variants.count)
+                    current_segment['text'] = final_text
+                    segments.append(current_segment)
+                    current_segment = None
+                    text_variants = []
                 continue
 
-            if text == current_text:
-                # 相同文本，延长结束帧
-                end_frame_idx = frame_idx
+            # 如果是第一个段
+            if current_segment is None:
+                current_segment = {
+                    'start_frame': frame_idx,
+                    'end_frame': frame_idx,
+                    'text': text
+                }
+                text_variants = [text]
             else:
-                # 新文本，保存之前的段
-                if current_text:
-                    start_time = start_frame_idx / self.extract_fps + self.start_time
-                    end_time = (end_frame_idx + 1) / self.extract_fps + self.start_time
+                # 计算与当前段文本的相似度
+                current_text = current_segment['text']
+                similarity = text_similarity(text, current_text)
+
+                # 如果相似度超过阈值，认为是同一句话
+                if similarity >= similarity_threshold:
+                    # 延长当前段
+                    current_segment['end_frame'] = frame_idx
+                    text_variants.append(text)
+                else:
+                    # 不同的文本，保存当前段并开始新段
+                    # 选择出现次数最多的文本作为最终文本
+                    final_text = max(set(text_variants), key=text_variants.count)
+                    current_segment['text'] = final_text
+
+                    # 计算时间戳
+                    start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
+                    end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
 
                     segments.append({
-                        'text': current_text,
+                        'text': final_text,
                         'start_time': start_time,
                         'end_time': end_time
                     })
 
-                # 开始新段
-                current_text = text
-                start_frame_idx = frame_idx
-                end_frame_idx = frame_idx
+                    # 开始新段
+                    current_segment = {
+                        'start_frame': frame_idx,
+                        'end_frame': frame_idx,
+                        'text': text
+                    }
+                    text_variants = [text]
 
         # 保存最后一段
-        if current_text:
-            start_time = start_frame_idx / self.extract_fps + self.start_time
-            end_time = (end_frame_idx + 1) / self.extract_fps + self.start_time
+        if current_segment:
+            final_text = max(set(text_variants), key=text_variants.count) if text_variants else current_segment['text']
+            current_segment['text'] = final_text
+
+            start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
+            end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
 
             segments.append({
-                'text': current_text,
+                'text': final_text,
                 'start_time': start_time,
                 'end_time': end_time
             })
 
-        print(f"合并后得到 {len(segments)} 个字幕段")
+        print(f"合并后得到 {len(segments)} 个字幕段（相似度阈值: {similarity_threshold}）")
         return segments
 
     def format_timestamp(self, seconds: float) -> str:
