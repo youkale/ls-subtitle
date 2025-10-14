@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Output files
+output/
+*.srt
+
+# Video files
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.flv
+*.wmv
+
+# PaddleOCR models cache
+.paddleocr/
