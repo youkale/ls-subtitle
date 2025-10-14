@@ -11,9 +11,39 @@
 - 生成标准SRT字幕文件
 - 支持自定义提取帧率和字幕区域
 
+## 系统要求
+
+- Python 3.12+
+- ffmpeg 和 ffprobe
+
+### 平台支持
+
+| 平台 | CPU模式 | GPU模式 | 说明 |
+|------|---------|---------|------|
+| **macOS** | ✅ | ❌ | 仅CPU，适合开发测试 |
+| **Linux** | ✅ | ✅ | 支持GPU加速 |
+| **Windows** | ✅ | ✅ | 支持GPU加速 |
+
+⚠️ **重要**: 如果你在macOS上开发但需要GPU加速，请参考 [DEPLOYMENT.md](DEPLOYMENT.md) 了解如何部署到Linux服务器
+
 ## 安装依赖
 
-### 系统依赖
+### 快速开始（推荐）
+
+使用自动安装脚本，会根据你的平台自动选择正确的版本：
+
+```bash
+./setup.sh
+```
+
+脚本会自动：
+- ✅ macOS: 安装 CPU 版本
+- ✅ Linux (有CUDA): 询问是否安装 GPU 版本
+- ✅ Linux (无CUDA): 安装 CPU 版本
+
+### 手动安装
+
+**系统依赖：**
 
 首先需要安装 ffmpeg 和 ffprobe：
 
@@ -30,56 +60,152 @@ sudo apt-get install ffmpeg
 **Windows:**
 下载并安装 [ffmpeg](https://ffmpeg.org/download.html)
 
-### Python依赖
-
-**CPU版本（默认）：**
-
-使用 uv 安装Python依赖：
+**Python依赖 (macOS - CPU版本):**
 
 ```bash
-uv sync
+# 使用 uv
+uv sync --extra cpu
+
+# 或使用 pip
+pip install -e ".[cpu]"
 ```
 
-或使用 pip：
-
-```bash
-pip install -e .
-```
+**Python依赖 (Linux - 参考下面的GPU安装)**
 
 **GPU版本（CUDA加速）：**
 
-如果你有NVIDIA GPU和CUDA环境，可以安装GPU版本以获得更快的处理速度：
+如果你有NVIDIA GPU和CUDA环境，可以安装GPU版本以获得更快的处理速度（3-5倍）。
 
-使用 uv：
+⚠️ **重要**: PaddlePaddle GPU版本需要从官方源手动安装，不在PyPI上。
 
-```bash
-# 先卸载CPU版本的paddlepaddle
-pip uninstall paddlepaddle
+### Linux/Windows GPU安装
 
-# 安装GPU依赖
-uv sync --extra gpu
-```
+⚠️ **重要提示**: Python 3.12 对 PaddlePaddle GPU 的支持有限。推荐使用以下方法：
 
-或使用 pip：
+#### 方法1: 使用安装脚本（推荐）
 
 ```bash
-# 先卸载CPU版本的paddlepaddle
-pip uninstall paddlepaddle
-
-# 安装GPU版本
-pip install -e ".[gpu]"
+./install_gpu.sh
 ```
 
-**注意**: GPU版本需要：
-- NVIDIA GPU
-- CUDA 11.2+ 或 CUDA 12.0+
+#### 方法2: 手动下载wheel包（Python 3.12 + CUDA 11.8/12.x）
+
+```bash
+# 1. 卸载CPU版本
+pip uninstall -y paddlepaddle
+
+# 2. 下载对应的wheel包
+wget https://paddle-wheel.bj.bcebos.com/3.0.0/linux/linux-gpu-cuda11.8-cudnn8.6-mkl-gcc8.2-avx/paddlepaddle_gpu-3.0.0.post118-cp312-cp312-linux_x86_64.whl
+
+# 3. 安装
+pip install paddlepaddle_gpu-3.0.0.post118-cp312-cp312-linux_x86_64.whl
+```
+
+#### 方法3: 使用Docker（最可靠）
+
+```bash
+# 拉取官方GPU镜像
+docker pull paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.6-trt8.5
+
+# 运行容器（挂载项目目录）
+docker run --gpus all -it -v $(pwd):/workspace \
+  paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.6-trt8.5 /bin/bash
+
+# 在容器中安装项目依赖
+cd /workspace
+pip install paddleocr opencv-python pillow numpy
+
+# 运行程序
+python run.py video.mp4 --gpu
+```
+
+#### 方法4: 使用Python 3.11（如果以上方法失败）
+
+```bash
+# 使用pyenv或conda安装Python 3.11
+pyenv install 3.11.9
+pyenv local 3.11.9
+
+# 重新安装依赖
+pip install paddlepaddle-gpu==3.0.0.post118 \
+  -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html
+pip install -e .
+```
+
+**PaddlePaddle 2.6.2 (稳定版，也兼容):**
+
+```bash
+# CUDA 11.8
+python -m pip install paddlepaddle-gpu==2.6.2.post118 -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html
+
+# CUDA 12.0
+python -m pip install paddlepaddle-gpu==2.6.2.post120 -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html
+```
+
+**查看更多版本:**
+
+访问 [PaddlePaddle官方安装页面](https://www.paddlepaddle.org.cn/install/quick) 查看所有可用版本。
+
+### macOS (仅支持CPU)
+
+```bash
+# macOS不支持NVIDIA GPU，只能使用CPU版本
+# 已包含在依赖中，执行 uv sync 即可
+uv sync
+
+# 在macOS上运行（CPU模式）
+python run.py video.mp4
+
+# ⚠️ --gpu 参数在macOS上无效，会自动降级到CPU模式
+```
+
+**如需GPU加速**: 请参考 [DEPLOYMENT.md](DEPLOYMENT.md) 将项目部署到Linux服务器
+
+### 系统要求
+
+**GPU版本要求：**
+- NVIDIA GPU (仅Linux/Windows)
+- CUDA 11.8 / 12.0 / 12.3
 - cuDNN 8.2+
+- Python 3.12+
+
+**验证GPU安装：**
+
+```bash
+# 检查CUDA
+nvidia-smi
+
+# 检查PaddlePaddle GPU支持
+python -c "
+import paddle
+print(f'PaddlePaddle版本: {paddle.__version__}')
+print(f'支持CUDA: {paddle.device.is_compiled_with_cuda()}')
+if paddle.device.is_compiled_with_cuda():
+    print(f'GPU数量: {paddle.device.cuda.device_count()}')
+    for i in range(paddle.device.cuda.device_count()):
+        print(f'  GPU {i}: {paddle.device.cuda.get_device_name(i)}')
+"
+```
+
+期望输出：
+```
+PaddlePaddle版本: 3.0.0
+支持CUDA: True
+GPU数量: 1
+  GPU 0: NVIDIA GeForce RTX 3090
+```
+
+**详细安装指南**: 如遇到问题，请查看 [INSTALL_GPU.md](INSTALL_GPU.md)
 
 ## 使用方法
 
 ### 基本用法
 
 ```bash
+# 方法1: 使用启动脚本（推荐，会过滤第三方库警告）
+python run.py <视频文件路径>
+
+# 方法2: 直接运行（会显示第三方库警告，但不影响功能）
 python main.py <视频文件路径>
 ```
 
@@ -128,21 +254,28 @@ python main.py video.mp4 --gpu --fps 30 --subtitle-bottom 0.1 --subtitle-top 0.4
 ### 完整示例
 
 ```bash
-# 处理视频文件，使用默认参数（CPU模式）
-python main.py video.mp4
+# 使用启动脚本（推荐，无警告信息）
+python run.py video.mp4
 
-# 处理视频文件，使用GPU加速
-python main.py video.mp4 --gpu
+# 使用GPU加速
+python run.py video.mp4 --gpu
 
-# 处理视频文件，指定所有参数
-python main.py video.mp4 -o output.srt --fps 25 --subtitle-bottom 0.1 --subtitle-top 0.4
+# 指定所有参数
+python run.py video.mp4 -o output.srt --fps 25 --subtitle-bottom 0.1 --subtitle-top 0.4
 
 # GPU加速 + 自定义参数
-python main.py video.mp4 --gpu --fps 30 -o output.srt
+python run.py video.mp4 --gpu --fps 30 -o output.srt
 
 # 输出将保存在 output/video.srt
 # 提取的帧会保存在 output/frames/ 目录
 ```
+
+**如果看到以下警告（不影响功能）：**
+```
+SyntaxWarning: invalid escape sequence  # 来自modelscope库
+UserWarning: No ccache found           # 来自paddle库
+```
+这些是第三方库的警告，使用 `run.py` 启动脚本可以过滤它们。
 
 ## 工作原理
 
@@ -256,14 +389,44 @@ python main.py video.mp4 --gpu --fps 30 -o output.srt
 
 - 可以减少提取帧率（如 `--fps 1` 每秒提取1帧）
 - **推荐**: 使用GPU加速（`--gpu` 参数），速度提升3-5倍
-- 安装GPU版本: `pip uninstall paddlepaddle && pip install -e ".[gpu]"`
+- 安装GPU版本参考上面的"GPU版本（CUDA加速）"章节
 
 ### 问题：GPU不可用
 
 - 确认已安装 `paddlepaddle-gpu` 而非 `paddlepaddle`
 - 检查CUDA是否正确安装：运行 `nvidia-smi`
-- 确认CUDA版本与paddlepaddle-gpu版本兼容
+- 确认CUDA版本与paddlepaddle-gpu版本兼容（3.0.0需要CUDA 11.8或12.0）
+- GPU版本需要从官方源安装，参考上面的GPU安装说明
 - 如果GPU检测失败，程序会自动降级到CPU模式
+
+### 问题：AttributeError set_optimization_level
+
+- 这是版本兼容性问题，确保使用 PaddlePaddle 3.0.0
+- 运行 `pip install paddlepaddle==3.0.0` 来固定版本
+- PaddleOCR 3.2.0 与 PaddlePaddle 3.0.0 兼容，但与 3.2.0 不兼容
+
+### 问题：看到SyntaxWarning或UserWarning
+
+这些是第三方库的警告，不影响功能：
+
+**方法1: 使用启动脚本（推荐）**
+```bash
+python run.py video.mp4  # 自动过滤警告
+```
+
+**方法2: 手动过滤警告**
+```bash
+python -W ignore::SyntaxWarning -W ignore::UserWarning main.py video.mp4
+```
+
+**方法3: 安装ccache（可选，仅Linux/macOS）**
+```bash
+# macOS
+brew install ccache
+
+# Ubuntu/Debian
+sudo apt-get install ccache
+```
 
 ## License
 

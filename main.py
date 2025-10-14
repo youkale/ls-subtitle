@@ -14,7 +14,7 @@ class VideoSubtitleExtractor:
 
     def __init__(self, output_dir: str = "output", extract_fps: int = 30,
                  subtitle_region_bottom: float = 0.1, subtitle_region_top: float = 0.45,
-                 use_gpu: bool = False):
+                 use_gpu: bool = False, start_time: float = 0, duration: float = None):
         """
         初始化字幕提取器
 
@@ -24,6 +24,8 @@ class VideoSubtitleExtractor:
             subtitle_region_bottom: 字幕区域底部位置（距离底部的百分比），默认0.1（10%）
             subtitle_region_top: 字幕区域顶部位置（距离底部的百分比），默认0.45（45%）
             use_gpu: 是否使用GPU加速，默认False
+            start_time: 开始时间（秒），默认0（从头开始）
+            duration: 处理时长（秒），默认None（处理到视频结束）
         """
         self.output_dir = Path(output_dir)
         self.frames_dir = self.output_dir / "frames"
@@ -31,6 +33,8 @@ class VideoSubtitleExtractor:
         self.subtitle_region_bottom = subtitle_region_bottom
         self.subtitle_region_top = subtitle_region_top
         self.use_gpu = use_gpu
+        self.start_time = start_time
+        self.duration = duration
 
         # 检测GPU可用性并设置设备
         if use_gpu:
@@ -50,6 +54,8 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
+            text_detection_model_name='PP-OCRv5_server_det',
+            text_recognition_model_name='PP-OCRv5_server_rec',
             ocr_version='PP-OCRv5',
             device=device  # PaddleOCR 3.2.0+ 使用device参数指定计算设备
         )
@@ -130,7 +136,7 @@ class VideoSubtitleExtractor:
 
     def extract_frames(self, video_path: str, fps: float) -> int:
         """
-        使用ffmpeg提取视频帧
+        使用ffmpeg提取视频帧，并裁剪到字幕区域
 
         Args:
             video_path: 视频文件路径
@@ -139,31 +145,80 @@ class VideoSubtitleExtractor:
         Returns:
             提取的帧数
         """
-        print(f"正在提取视频帧（每秒{self.extract_fps}帧）...")
+        # 构建处理时间信息
+        time_info = []
+        if self.start_time > 0:
+            time_info.append(f"从{self.start_time:.1f}秒开始")
+        if self.duration:
+            time_info.append(f"处理{self.duration:.1f}秒")
+        else:
+            time_info.append("处理到视频结束")
+
+        time_desc = "，".join(time_info) if time_info else "处理整个视频"
+        print(f"正在提取视频帧（每秒{self.extract_fps}帧），并裁剪到字幕区域...")
+        print(f"处理范围: {time_desc}")
+
+        # 获取视频信息
+        video_info = self.get_video_info(video_path)
+        width = video_info['width']
+        height = video_info['height']
+        total_duration = video_info['duration']
+
+        # 验证时间参数
+        if self.start_time >= total_duration:
+            raise ValueError(f"开始时间({self.start_time}s)超过视频总时长({total_duration:.1f}s)")
+
+        # 计算实际处理时长
+        actual_duration = self.duration
+        if actual_duration:
+            if self.start_time + actual_duration > total_duration:
+                actual_duration = total_duration - self.start_time
+                print(f"注意: 处理时长已调整为{actual_duration:.1f}秒（到视频结束）")
+
+        # 计算裁剪区域（与ocr_frames中的计算保持一致）
+        bottom_y = int(height * (1 - self.subtitle_region_top))  # 顶部边界
+        top_y = int(height * (1 - self.subtitle_region_bottom))  # 底部边界
+        crop_height = top_y - bottom_y
+
+        print(f"视频信息: {width}x{height}, 总时长={total_duration:.1f}秒")
+        print(f"字幕区域: y={bottom_y} 到 y={top_y} (高度={crop_height}px, 占比{self.subtitle_region_bottom*100:.0f}%-{self.subtitle_region_top*100:.0f}%)")
 
         # 创建帧输出目录
         if self.frames_dir.exists():
             shutil.rmtree(self.frames_dir)
         self.frames_dir.mkdir(parents=True, exist_ok=True)
 
-        # 根据参数提取指定帧率的帧
+        # 使用ffmpeg提取帧，并使用crop filter裁剪到字幕区域
+        # crop语法: crop=width:height:x:y
         output_pattern = str(self.frames_dir / "frame_%06d.jpg")
 
         cmd = [
             'ffmpeg',
-            '-i', video_path,
-            '-vf', f'fps={self.extract_fps}',  # 使用指定的提取帧率
+        ]
+
+        # 添加开始时间参数（如果指定）
+        if self.start_time > 0:
+            cmd.extend(['-ss', str(self.start_time)])
+
+        cmd.extend(['-i', video_path])
+
+        # 添加时长参数（如果指定）
+        if actual_duration:
+            cmd.extend(['-t', str(actual_duration)])
+
+        cmd.extend([
+            '-vf', f'fps={self.extract_fps},crop={width}:{crop_height}:0:{bottom_y}',  # 先设置fps再裁剪
             '-q:v', '2',  # 图片质量
             output_pattern,
             '-y'  # 覆盖已存在的文件
-        ]
+        ])
 
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
 
             # 统计提取的帧数
             frame_count = len(list(self.frames_dir.glob("frame_*.jpg")))
-            print(f"成功提取 {frame_count} 帧")
+            print(f"成功提取并裁剪 {frame_count} 帧")
 
             return frame_count
 
@@ -189,46 +244,186 @@ class VideoSubtitleExtractor:
 
         return (0, subtitle_y, width, subtitle_height)
 
+    def preview_subtitle_region(self, video_path: str, frame_times: list = None):
+        """
+        预览字幕区域，生成多个时间点的标注图片
+
+        Args:
+            video_path: 视频文件路径
+            frame_times: 要预览的时间点列表（秒），如果为None则自动选择多个时间点
+        """
+        print(f"生成字幕区域预览...")
+
+        # 获取视频时长
+        try:
+            duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                          '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
+            result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True)
+            duration = float(result.stdout.strip())
+            print(f"视频时长: {duration:.1f}秒")
+        except:
+            print("警告: 无法获取视频时长，使用默认时间点")
+            duration = 60
+
+        # 如果没有指定时间点，自动选择多个时间点
+        if frame_times is None:
+            # 选择开头、1/4、1/2、3/4、结尾前的时间点
+            frame_times = [
+                10,  # 开头10秒
+                duration * 0.25,  # 1/4处
+                duration * 0.5,   # 中间
+                duration * 0.75,  # 3/4处
+                max(10, duration - 10)  # 结尾前10秒
+            ]
+            # 去重并排序
+            frame_times = sorted(list(set([t for t in frame_times if 0 < t < duration])))
+
+        print(f"将预览 {len(frame_times)} 个时间点:")
+        for i, t in enumerate(frame_times, 1):
+            print(f"  {i}. {t:.1f}秒")
+        print()
+
+        preview_files = []
+        crop_files = []
+
+        for idx, time_sec in enumerate(frame_times):
+            # 提取指定时间点的帧
+            temp_frame = self.frames_dir / f"preview_frame_{idx}.jpg"
+            cmd = [
+                'ffmpeg',
+                '-ss', str(time_sec),
+                '-i', video_path,
+                '-frames:v', '1',
+                str(temp_frame),
+                '-y'
+            ]
+
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+                # 读取图片
+                img = cv2.imread(str(temp_frame))
+                if img is None:
+                    print(f"⚠ 无法读取第{idx+1}个预览帧 (时间: {time_sec:.1f}s)")
+                    continue
+
+                height, width = img.shape[:2]
+
+                # 计算字幕区域
+                bottom_y = int(height * (1 - self.subtitle_region_top))
+                top_y = int(height * (1 - self.subtitle_region_bottom))
+
+                # 创建标注图片
+                preview_img = img.copy()
+
+                # 绘制字幕区域矩形（绿色）
+                cv2.rectangle(preview_img, (0, bottom_y), (width, top_y), (0, 255, 0), 3)
+
+                # 添加文字标注
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(preview_img, f'Subtitle Region (Time: {time_sec:.1f}s)',
+                           (10, bottom_y - 10), font, 1, (0, 255, 0), 2)
+                cv2.putText(preview_img, f'Bottom: {self.subtitle_region_bottom*100:.0f}%',
+                           (10, top_y + 30), font, 0.8, (0, 255, 0), 2)
+                cv2.putText(preview_img, f'Top: {self.subtitle_region_top*100:.0f}%',
+                           (10, bottom_y - 40), font, 0.8, (0, 255, 0), 2)
+
+                # 裁剪字幕区域
+                subtitle_crop = img[bottom_y:top_y, :]
+
+                # 保存完整预览图
+                preview_path = self.output_dir / f"preview_region_{idx+1}_{int(time_sec)}s.jpg"
+                cv2.imwrite(str(preview_path), preview_img)
+                preview_files.append(preview_path)
+
+                # 保存裁剪后的字幕区域
+                crop_path = self.output_dir / f"preview_crop_{idx+1}_{int(time_sec)}s.jpg"
+                cv2.imwrite(str(crop_path), subtitle_crop)
+                crop_files.append(crop_path)
+
+                print(f"✓ 第{idx+1}个预览 (时间: {time_sec:.1f}s) 已生成")
+
+            except subprocess.CalledProcessError as e:
+                print(f"✗ 提取第{idx+1}个预览帧失败 (时间: {time_sec:.1f}s): {e.stderr}")
+
+        # 打印总结
+        print(f"\n{'='*60}")
+        print(f"预览生成完成！共 {len(preview_files)} 个时间点")
+        print(f"{'='*60}")
+        print(f"\n完整标注图片 ({len(preview_files)}张):")
+        for f in preview_files:
+            print(f"  - {f}")
+
+        print(f"\n字幕裁剪图片 ({len(crop_files)}张):")
+        for f in crop_files:
+            print(f"  - {f}")
+
+        if preview_files:
+            # 使用第一张图获取尺寸信息
+            img = cv2.imread(str(preview_files[0]))
+            height, width = img.shape[:2]
+            bottom_y = int(height * (1 - self.subtitle_region_top))
+            top_y = int(height * (1 - self.subtitle_region_bottom))
+
+            print(f"\n字幕区域信息：")
+            print(f"  视频尺寸: {width}x{height}")
+            print(f"  字幕区域: y={bottom_y} 到 y={top_y} (高度={top_y-bottom_y}px)")
+            print(f"  占比: 底部{self.subtitle_region_bottom*100:.0f}% 到 {self.subtitle_region_top*100:.0f}%")
+
     def ocr_frames(self) -> List[Dict]:
         """
-        对所有帧进行OCR识别
+        对所有帧进行OCR识别（帧已经是裁剪后的字幕区域）
 
         Returns:
             识别结果列表
         """
-        print(f"正在进行OCR识别（字幕区域：底部{self.subtitle_region_bottom*100:.0f}%-{self.subtitle_region_top*100:.0f}%）...")
+        print(f"正在进行OCR识别...")
 
         frame_files = sorted(self.frames_dir.glob("frame_*.jpg"))
         results = []
 
         for idx, frame_path in enumerate(frame_files):
-            # 读取图片
+            # 读取图片（已经是裁剪后的字幕区域）
             img = cv2.imread(str(frame_path))
-            height, width = img.shape[:2]
-
-            # 计算字幕区域（从底部开始）
-            # 例如：10%-45% 表示从底部10%到45%的区域
-            bottom_y = int(height * (1 - self.subtitle_region_top))  # 顶部边界
-            top_y = int(height * (1 - self.subtitle_region_bottom))  # 底部边界
-            subtitle_region = img[bottom_y:top_y, :]
+            if img is None:
+                print(f"警告: 无法读取帧 {frame_path}")
+                continue
 
             # OCR识别 (使用PP-OCRv5模型的predict方法)
-            ocr_result = self.ocr.predict(subtitle_region, use_textline_orientation=True)
+            # 现在图片已经是字幕区域了，不需要再次裁剪
+            ocr_result = self.ocr.predict(img, use_textline_orientation=True)
 
             # 提取文本
             text_lines = []
             if ocr_result and len(ocr_result) > 0:
-                # PaddleOCR 3.2.0 predict() 返回格式：
-                # [{'dt_polys': [...], 'rec_text': '文本', 'rec_score': 0.xx}, ...]
+                # PaddleOCR 3.2.0 predict() 返回 OCRResult 对象（类字典）
                 for item in ocr_result:
-                    if isinstance(item, dict):
-                        # 新版本格式：字典形式
+                    # OCRResult 是类字典对象，使用字典方式访问
+                    if hasattr(item, 'get'):
+                        # 尝试获取 rec_texts 和 rec_scores（复数形式）
+                        texts = item.get('rec_texts')
+                        scores = item.get('rec_scores')
+
+                        if texts and scores:
+                            for text, score in zip(texts, scores):
+                                if score > 0.5 and text.strip():
+                                    text_lines.append(text)
+                        else:
+                            # 尝试单数形式
+                            text = item.get('rec_text', '')
+                            confidence = item.get('rec_score', 0.0)
+                            if confidence > 0.5 and text.strip():
+                                text_lines.append(text)
+
+                    # 兼容普通字典格式
+                    elif isinstance(item, dict):
                         text = item.get('rec_text', '')
                         confidence = item.get('rec_score', 0.0)
-                        if confidence > 0.5 and text.strip():  # 过滤低置信度结果
+                        if confidence > 0.5 and text.strip():
                             text_lines.append(text)
+
+                    # 兼容列表格式 (旧版本API)
                     elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                        # 旧版本格式：列表形式 [[bbox, (text, confidence)], ...]
                         if isinstance(item[1], (list, tuple)) and len(item[1]) >= 2:
                             text = item[1][0]
                             confidence = item[1][1]
@@ -240,9 +435,12 @@ class VideoSubtitleExtractor:
             # 计算实际时间戳（根据提取帧率）
             timestamp = idx / self.extract_fps
 
+            # 调整时间戳，考虑开始时间偏移
+            adjusted_timestamp = timestamp + self.start_time
+
             results.append({
                 'frame_index': idx + 1,
-                'timestamp': timestamp,
+                'timestamp': adjusted_timestamp,
                 'text': combined_text
             })
 
@@ -428,7 +626,7 @@ def main():
     parser.add_argument(
         '--subtitle-bottom',
         type=float,
-        default=0.1,
+        default=0.2,
         help='字幕区域底部位置，距离底部的百分比（默认: 0.1，即10%%）'
     )
     parser.add_argument(
@@ -442,6 +640,29 @@ def main():
         action='store_true',
         help='使用GPU加速（需要安装paddlepaddle-gpu）'
     )
+    parser.add_argument(
+        '--preview',
+        action='store_true',
+        help='仅预览字幕区域，不进行OCR识别（用于调试字幕位置）'
+    )
+    parser.add_argument(
+        '--preview-times',
+        type=str,
+        default=None,
+        help='预览模式下的时间点（秒），用逗号分隔，如 "10,30,60,90"。不指定则自动选择多个时间点'
+    )
+    parser.add_argument(
+        '--start-time',
+        type=float,
+        default=0,
+        help='开始处理的时间点（秒），默认: 0（从头开始）'
+    )
+    parser.add_argument(
+        '--duration',
+        type=float,
+        default=None,
+        help='处理的时长（秒），默认: None（处理到视频结束）'
+    )
 
     args = parser.parse_args()
 
@@ -453,14 +674,43 @@ def main():
     if args.subtitle_bottom >= args.subtitle_top:
         parser.error("--subtitle-bottom 必须小于 --subtitle-top")
 
+    # 验证时间参数
+    if args.start_time < 0:
+        parser.error("--start-time 必须 >= 0")
+    if args.duration is not None and args.duration <= 0:
+        parser.error("--duration 必须 > 0")
+
     # 创建提取器
     extractor = VideoSubtitleExtractor(
         output_dir=args.output_dir,
         extract_fps=args.fps,
         subtitle_region_bottom=args.subtitle_bottom,
         subtitle_region_top=args.subtitle_top,
-        use_gpu=args.gpu
+        use_gpu=args.gpu,
+        start_time=args.start_time,
+        duration=args.duration
     )
+
+    # 如果是预览模式
+    if args.preview:
+        print("=" * 50)
+        print("字幕区域预览模式")
+        print("=" * 50)
+        extractor.output_dir.mkdir(parents=True, exist_ok=True)
+        extractor.frames_dir.mkdir(parents=True, exist_ok=True)
+
+        # 解析预览时间点
+        preview_times = None
+        if args.preview_times:
+            try:
+                preview_times = [float(t.strip()) for t in args.preview_times.split(',')]
+                print(f"使用指定的时间点: {preview_times}")
+            except ValueError:
+                print(f"警告: 无法解析时间点 '{args.preview_times}'，将自动选择时间点")
+
+        extractor.preview_subtitle_region(args.video, preview_times)
+        print("\n提示：检查生成的图片，如果字幕位置不对，请调整 --subtitle-bottom 和 --subtitle-top 参数")
+        return
 
     # 处理视频
     extractor.process_video(args.video, args.output)

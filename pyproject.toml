@@ -5,14 +5,20 @@ description = "Video subtitle recognition using PaddleOCR"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "paddlepaddle>=2.6.0",
     "paddleocr>=3.2.0",
     "opencv-python>=4.8.0",
     "pillow>=10.0.0",
     "numpy>=1.24.0",
 ]
 
-[project.optional-dependencies]
-gpu = [
-    "paddlepaddle-gpu>=2.6.0",
-]
+
+# PaddlePaddle 需要从官方源安装（不在PyPI上）
+#
+# macOS / Linux CPU:
+#   uv pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+#
+# Linux GPU (CUDA 12.6):
+#   uv pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+#
+# 推荐使用自动安装脚本:
+#   ./setup.sh
