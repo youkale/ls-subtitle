@@ -548,10 +548,10 @@ class VideoSubtitleExtractor:
 
         img_height, img_width = img.shape[:2]
 
-        # 配置参数
-        width_delta = img_width * 0.3   # 水平位置容忍度（30%）
-        height_delta = img_height * 0.1  # 垂直位置容忍度（10%）
-        groups_tolerance = img_height * 0.05  # 分组容忍度（5%）
+        # 配置参数 - 大幅放宽容忍度以减少误过滤
+        width_delta = img_width * 0.5   # 水平位置容忍度（50%，原30%）
+        height_delta = img_height * 0.4  # 垂直位置容忍度（40%，原10%）
+        groups_tolerance = img_height * 0.5  # 分组容忍度（50%，原5%）
 
         x_center_frame = img_width / 2
 
