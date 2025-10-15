@@ -121,13 +121,13 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.8,      # 识别阈值，优化后的固定值
-            text_det_box_thresh=0.6,        # 检测阈值，优化后的固定值
-            text_det_thresh=0.3,            # 像素阈值，提高文本检测敏感度
+            text_rec_score_thresh=0.6,      # 识别阈值，平衡敏感度和噪声过滤
+            text_det_box_thresh=0.4,        # 检测阈值，适中设置
+            text_det_thresh=0.2,            # 像素阈值，适中敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
-            text_detection_model_name='PP-OCRv5_server_det',
-            text_recognition_model_name='PP-OCRv5_server_rec',
-            ocr_version='PP-OCRv5',
+            text_detection_model_name='PP-OCRv4_server_det',
+            text_recognition_model_name='PP-OCRv4_server_rec',
+            ocr_version='PP-OCRv4',
             device=device  # PaddleOCR 3.2.0+ 使用device参数指定计算设备
         )
 
@@ -802,6 +802,75 @@ class VideoSubtitleExtractor:
             return self.cc.convert(text)
         return text
 
+    def _is_likely_subtitle_by_geometry(self, box_coords: list, text: str, debug_print: bool = False) -> bool:
+        """
+        基于几何特征判断文本是否可能是字幕
+
+        Args:
+            box_coords: 文本边界框坐标 [x1, y1, x2, y2]
+            text: 文本内容
+            debug_print: 是否打印调试信息
+
+        Returns:
+            bool: True表示可能是字幕，False表示可能是噪声
+        """
+        if len(box_coords) < 4:
+            return True  # 如果坐标不完整，默认通过
+
+        x1, y1, x2, y2 = box_coords[:4]
+        width = x2 - x1
+        height = y2 - y1
+        char_count = len(text)
+
+        if width <= 0 or height <= 0 or char_count == 0:
+            return True  # 避免除零错误，默认通过
+
+        # 计算几何特征
+        aspect_ratio = width / height
+        avg_char_width = width / char_count
+        relative_height = height / 480  # 假设图片高度480px（裁剪后的字幕区域）
+
+        # 基于分析结果的过滤规则
+        is_wide_text = aspect_ratio > 1.6  # 宽高比大于1.6（字幕通常更宽扁）
+        is_reasonable_height = relative_height < 0.4  # 相对高度小于40%
+        is_reasonable_char_width = avg_char_width < 100  # 平均字符宽度小于100px
+
+        # 特殊规则：过滤明显的车牌模式
+        is_license_plate = self._is_license_plate_pattern(text)
+
+        # 单字符特殊处理：对于单个汉字，放宽宽高比要求
+        import re
+        is_single_char = char_count == 1
+        is_chinese_char = bool(re.match(r'^[\u4e00-\u9fff]$', text))
+
+        # 综合判断
+        if is_single_char and is_chinese_char:
+            # 单个汉字：只检查高度和模式，不检查宽高比
+            passes_geometry = is_reasonable_height and is_reasonable_char_width
+        else:
+            # 多字符：检查所有几何特征
+            passes_geometry = is_wide_text and is_reasonable_height and is_reasonable_char_width
+
+        passes_pattern = not is_license_plate
+
+        result = passes_geometry and passes_pattern
+
+        if debug_print:
+            print(f"      几何分析: 宽高比={aspect_ratio:.2f}, 相对高度={relative_height:.3f}, 字符宽度={avg_char_width:.1f}")
+            print(f"      规则检查: 宽扁={is_wide_text}, 高度合理={is_reasonable_height}, 字符合理={is_reasonable_char_width}")
+            print(f"      模式检查: 非车牌={not is_license_plate}")
+            print(f"      最终结果: {'通过' if result else '过滤'}")
+
+        return result
+
+    def _is_license_plate_pattern(self, text: str) -> bool:
+        """检查是否为车牌号码模式"""
+        import re
+        # 中国车牌格式：地区码+字母+数字
+        license_pattern = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领海][A-Z]·?\d+$'
+        return bool(re.match(license_pattern, text))
+
+
     def _ocr_image(self, img, debug_print: bool = False) -> Dict:
         """
         核心的单张图片OCR识别逻辑
@@ -906,19 +975,24 @@ class VideoSubtitleExtractor:
                                 print(f"  检测到文本 {j+1}: \"{text}\" (置信度: {score:.3f})")
 
                             if score > 0.5:  # 置信度阈值
-                                # 转换为简体中文
-                                simplified_text = self._convert_to_simplified(text)
+                                # 几何特征过滤
+                                box_coords = box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
+                                if self._is_likely_subtitle_by_geometry(box_coords, text, debug_print):
+                                    # 转换为简体中文
+                                    simplified_text = self._convert_to_simplified(text)
 
-                                text_info = {
-                                    'text': text,
-                                    'simplified_text': simplified_text,
-                                    'score': float(score),
-                                    'box': box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
-                                }
-                                result_data['texts'].append(text_info)
+                                    text_info = {
+                                        'text': text,
+                                        'simplified_text': simplified_text,
+                                        'score': float(score),
+                                        'box': box_coords
+                                    }
+                                    result_data['texts'].append(text_info)
 
-                                if debug_print:
-                                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
+                                    if debug_print:
+                                        print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
+                                elif debug_print:
+                                    print(f"    ❌ 几何过滤: \"{text}\" (置信度: {score:.3f})")
                             else:
                                 if debug_print:
                                     print(f"    ✗ 跳过: 置信度过低 ({score:.3f} < 0.5)")
