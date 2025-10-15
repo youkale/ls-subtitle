@@ -460,12 +460,30 @@ class VideoSubtitleExtractor:
                 continue
 
             # 使用抽象的核心OCR识别方法
-            debug_print = (idx == 0)  # 只在第一帧打印调试信息
+            debug_print = (idx == 0) or (frame_path.name == "frame_000708.jpg")  # 第一帧或特定帧打印调试信息
             if debug_print:
                 tqdm.write(f"批量识别调试: 处理帧 {frame_path.name}")
 
             try:
+                # 特殊调试：为frame_000708保存调试图片
+                if frame_path.name == "frame_000708.jpg":
+                    debug_img_path = f"debug_{frame_path.name}"
+                    cv2.imwrite(debug_img_path, img)
+                    tqdm.write(f"🔍 保存调试图片: {debug_img_path}, 尺寸: {img.shape}")
+
                 ocr_result = self._ocr_image(img, debug_print=debug_print)
+
+                # 从文件名提取真实的帧索引
+                frame_name = frame_path.stem  # frame_000708
+                real_frame_index = int(frame_name.split('_')[1])  # 708
+
+                # 特殊调试：详细输出frame_000708的OCR结果
+                if frame_path.name == "frame_000708.jpg":
+                    tqdm.write(f"🔍 frame_000708 OCR原始结果:")
+                    tqdm.write(f"  - 识别到的文本数量: {len(ocr_result['texts'])}")
+                    for i, text_info in enumerate(ocr_result['texts']):
+                        tqdm.write(f"  - 文本{i+1}: \"{text_info['text']}\" -> \"{text_info['simplified_text']}\" (置信度: {text_info['score']:.3f})")
+                    tqdm.write(f"  - 合并后文本: \"{ocr_result['combined_text']}\"")
 
                 # 如果有识别结果，保存到字典中
                 if ocr_result['texts']:
@@ -489,7 +507,7 @@ class VideoSubtitleExtractor:
                         results[str(frame_path)] = {
                             'text': combined_text,
                             'box': [xmin, ymin, xmax, ymax],
-                            'frame_index': idx,
+                            'frame_index': real_frame_index,  # 使用真实的帧索引
                             'items': text_items  # 保留原始文本项
                         }
 
@@ -570,6 +588,19 @@ class VideoSubtitleExtractor:
             x_center = (xmin + xmax) / 2
             text_height = ymax - ymin
 
+            # 特殊调试：frame_000708
+            is_frame_708 = "frame_000708.jpg" in frame_path
+            if is_frame_708:
+                print(f"\n🔍 调试frame_000708过滤过程:")
+                print(f"  文本: \"{value['text']}\"")
+                print(f"  边界框: [{xmin}, {ymin}, {xmax}, {ymax}]")
+                print(f"  y_center: {y_center:.1f}, x_center: {x_center:.1f}")
+                print(f"  text_height: {text_height:.1f}")
+                print(f"  标准中心: {center:.1f} (容忍±{height_delta:.1f})")
+                print(f"  标准高度: {word_height:.1f} (容忍±{groups_tolerance:.1f})")
+                print(f"  y位置检查: {center - height_delta:.1f} < {y_center:.1f} < {center + height_delta:.1f} = {center - height_delta < y_center < center + height_delta}")
+                print(f"  高度检查: {word_height - groups_tolerance:.1f} <= {text_height:.1f} <= {word_height + groups_tolerance:.1f} = {word_height - groups_tolerance <= text_height <= word_height + groups_tolerance}")
+
             # 检查是否在字幕区域内
             if (center - height_delta < y_center < center + height_delta and
                 word_height - groups_tolerance <= text_height <= word_height + groups_tolerance):
@@ -588,6 +619,12 @@ class VideoSubtitleExtractor:
                     'box': merged_box,
                     'frame_index': value['frame_index']
                 }
+
+                if is_frame_708:
+                    print(f"  ✅ frame_000708 通过过滤，保留文本: \"{merged_text}\"")
+            else:
+                if is_frame_708:
+                    print(f"  ❌ frame_000708 被过滤掉，原因: 位置或高度不匹配")
 
         # 第三步：填充连续帧之间的空白
         if not filtered_result:
@@ -933,48 +970,6 @@ class VideoSubtitleExtractor:
 
         return len(common_chars) >= min_len * 0.6
 
-    def _should_filter_text(self, text: str, duration_seconds: float) -> bool:
-        """
-        判断文本是否应该被过滤掉
-
-        Args:
-            text: 要检查的文本
-            duration_seconds: 文本持续时间（秒）
-
-        Returns:
-            True如果应该过滤，False如果应该保留
-        """
-        if not text or not text.strip():
-            return True
-
-        text = text.strip()
-        duration_ms = duration_seconds * 1000
-
-        # 规则1: 过滤纯数字的文本（通常是页码、时间码等噪声）
-        if text.isdigit() and len(text) <= 3:
-            return True
-
-        # 规则2: 过滤纯英文字母且很短的文本
-        if text.isalpha() and text.isascii() and len(text) <= 2:
-            return True
-
-        # 规则3: 过滤特殊字符占比高的文本
-        if len(text) > 0:
-            special_char_ratio = len([c for c in text if not c.isalnum()]) / len(text)
-            if special_char_ratio > 0.5:
-                return True
-
-        # 规则4: 过滤极短时长的文本（可能是噪声）
-        if duration_ms < 50:  # 小于50毫秒
-            return True
-
-        # 规则5: 过滤单个字符且时长很短
-        if len(text) == 1 and duration_ms < 100:
-            # 但保留中文字符
-            if not ('\u4e00' <= text <= '\u9fff'):
-                return True
-
-        return False
 
     def _finalize_current_segment(self, current_segment: Dict, text_variants: List[str], segments: List[Dict]):
         """完成当前段落并添加到结果中"""
@@ -1000,12 +995,6 @@ class VideoSubtitleExtractor:
         # 计算时间戳
         start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
         end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
-        duration = end_time - start_time
-
-        # 检查是否应该过滤这个文本
-        if self._should_filter_text(final_text, duration):
-            print(f"过滤噪声文本: \"{final_text}\" (时长: {duration*1000:.0f}ms)")
-            return
 
         segments.append({
             'text': final_text,
@@ -1376,7 +1365,6 @@ def main():
         print("=" * 50)
         print("单张图片OCR识别模式")
         print("=" * 50)
-
 
         try:
             # 执行单图OCR
