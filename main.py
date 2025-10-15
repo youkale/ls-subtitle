@@ -121,9 +121,9 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.7,      # 识别阈值，平衡敏感度和噪声过滤
+            text_rec_score_thresh=0.8,      # 识别阈值，平衡敏感度和噪声过滤
             text_det_box_thresh=0.5,        # 检测阈值，适中设置
-            text_det_thresh=0.01,            # 像素阈值，适中敏感度
+            text_det_thresh=0.6,            # 像素阈值，适中敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
@@ -812,10 +812,10 @@ class VideoSubtitleExtractor:
         avg_char_width = width / char_count
         relative_height = height / img_height  # 使用实际图片高度计算相对高度
 
-        # 基于分析结果的过滤规则
+        # 基于分析结果的过滤规则（针对PP-OCRv5优化）
         is_wide_text = aspect_ratio > 1.6  # 宽高比大于1.6（字幕通常更宽扁）
-        is_reasonable_height = relative_height < 0.4  # 相对高度小于40%
-        is_reasonable_char_width = avg_char_width < 100  # 平均字符宽度小于100px
+        is_reasonable_height = relative_height < 0.5  # 相对高度小于50%（放宽阈值适应v5）
+        is_reasonable_char_width = avg_char_width < 120  # 平均字符宽度小于120px（放宽阈值适应v5）
 
         # 特殊规则：过滤明显的车牌模式
         is_license_plate = self._is_license_plate_pattern(text)
@@ -848,8 +848,8 @@ class VideoSubtitleExtractor:
     def _is_license_plate_pattern(self, text: str) -> bool:
         """检查是否为车牌号码模式"""
         import re
-        # 中国车牌格式：地区码+字母+数字
-        license_pattern = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领海][A-Z]·?\d+$'
+        # 中国车牌格式：地区码+字母+数字（支持·和-分隔符）
+        license_pattern = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领海][A-Z][·\-]?\d+$'
         return bool(re.match(license_pattern, text))
 
 
@@ -888,7 +888,13 @@ class VideoSubtitleExtractor:
 
             if ocr_result and len(ocr_result) > 0:
                 if debug_print:
-                    print(f"OCR识别完成，找到 {len(ocr_result)} 个文本区域")
+                    dt_polys_count = len(ocr_result[0]['dt_polys']) if ocr_result and 'dt_polys' in ocr_result[0] else 0
+                    rec_texts_count = len(ocr_result[0]['rec_texts']) if ocr_result and 'rec_texts' in ocr_result[0] else 0
+                    print(f"OCR识别完成，检测到 {dt_polys_count} 个文本区域，成功识别 {rec_texts_count} 个文本")
+
+                    # 显示检测失败的区域
+                    if dt_polys_count > rec_texts_count:
+                        print(f"⚠️  有 {dt_polys_count - rec_texts_count} 个检测区域识别失败")
 
                 for i, item in enumerate(ocr_result):
                     # 尝试不同的方式获取数据
