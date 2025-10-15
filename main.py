@@ -73,8 +73,7 @@ class VideoSubtitleExtractor:
 
     def __init__(self, output_dir: str = "output", extract_fps: int = 30,
                  subtitle_region_bottom: float = 0.1, subtitle_region_top: float = 0.45,
-                 use_gpu: bool = True, start_time: float = 0, duration: float = None,
-                 ocr_rec_thresh: float = 0.5, ocr_det_thresh: float = 0.3):
+                 use_gpu: bool = True, start_time: float = 0, duration: float = None):
         """
         初始化字幕提取器
 
@@ -122,10 +121,10 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=ocr_rec_thresh,  # 识别阈值，可通过参数调整
-            text_det_box_thresh=ocr_det_thresh,    # 检测阈值，可通过参数调整
-            text_det_thresh=0.1,                   # 像素阈值，提高文本检测敏感度
-            text_det_unclip_ratio=2.5,             # 扩张系数，扩大文本检测区域
+            text_rec_score_thresh=0.5,      # 识别阈值，优化后的固定值
+            text_det_box_thresh=0.3,        # 检测阈值，优化后的固定值
+            text_det_thresh=0.1,            # 像素阈值，提高文本检测敏感度
+            text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
             ocr_version='PP-OCRv5',
@@ -934,6 +933,49 @@ class VideoSubtitleExtractor:
 
         return len(common_chars) >= min_len * 0.6
 
+    def _should_filter_text(self, text: str, duration_seconds: float) -> bool:
+        """
+        判断文本是否应该被过滤掉
+
+        Args:
+            text: 要检查的文本
+            duration_seconds: 文本持续时间（秒）
+
+        Returns:
+            True如果应该过滤，False如果应该保留
+        """
+        if not text or not text.strip():
+            return True
+
+        text = text.strip()
+        duration_ms = duration_seconds * 1000
+
+        # 规则1: 过滤纯数字的文本（通常是页码、时间码等噪声）
+        if text.isdigit() and len(text) <= 3:
+            return True
+
+        # 规则2: 过滤纯英文字母且很短的文本
+        if text.isalpha() and text.isascii() and len(text) <= 2:
+            return True
+
+        # 规则3: 过滤特殊字符占比高的文本
+        if len(text) > 0:
+            special_char_ratio = len([c for c in text if not c.isalnum()]) / len(text)
+            if special_char_ratio > 0.5:
+                return True
+
+        # 规则4: 过滤极短时长的文本（可能是噪声）
+        if duration_ms < 50:  # 小于50毫秒
+            return True
+
+        # 规则5: 过滤单个字符且时长很短
+        if len(text) == 1 and duration_ms < 100:
+            # 但保留中文字符
+            if not ('\u4e00' <= text <= '\u9fff'):
+                return True
+
+        return False
+
     def _finalize_current_segment(self, current_segment: Dict, text_variants: List[str], segments: List[Dict]):
         """完成当前段落并添加到结果中"""
         if not current_segment:
@@ -958,6 +1000,12 @@ class VideoSubtitleExtractor:
         # 计算时间戳
         start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
         end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
+        duration = end_time - start_time
+
+        # 检查是否应该过滤这个文本
+        if self._should_filter_text(final_text, duration):
+            print(f"过滤噪声文本: \"{final_text}\" (时长: {duration*1000:.0f}ms)")
+            return
 
         segments.append({
             'text': final_text,
@@ -1309,18 +1357,6 @@ def main():
         action='store_true',
         help='单图OCR模式：保存识别结果到文本文件'
     )
-    parser.add_argument(
-        '--ocr-rec-thresh',
-        type=float,
-        default=0.5,
-        help='OCR识别阈值，越低越敏感（默认: 0.5，范围: 0.1-0.9）'
-    )
-    parser.add_argument(
-        '--ocr-det-thresh',
-        type=float,
-        default=0.3,
-        help='OCR检测阈值，越低越敏感（默认: 0.3，范围: 0.1-0.9）'
-    )
 
     args = parser.parse_args()
 
@@ -1338,9 +1374,7 @@ def main():
             subtitle_region_top=args.subtitle_top,
             use_gpu=not args.cpu,
             start_time=0,
-            duration=None,
-            ocr_rec_thresh=args.ocr_rec_thresh,
-            ocr_det_thresh=args.ocr_det_thresh
+            duration=None
         )
 
         try:
@@ -1392,9 +1426,7 @@ def main():
         subtitle_region_top=args.subtitle_top,
         use_gpu=not args.cpu,  # 如果指定 --cpu 则不使用GPU
         start_time=args.start_time,
-        duration=args.duration,
-        ocr_rec_thresh=args.ocr_rec_thresh,
-        ocr_det_thresh=args.ocr_det_thresh
+        duration=args.duration
     )
 
     # 如果是预览模式
