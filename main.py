@@ -121,8 +121,8 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.5,      # 识别阈值，优化后的固定值
-            text_det_box_thresh=0.3,        # 检测阈值，优化后的固定值
+            text_rec_score_thresh=0.8,      # 识别阈值，优化后的固定值
+            text_det_box_thresh=0.6,        # 检测阈值，优化后的固定值
             text_det_thresh=0.1,            # 像素阈值，提高文本检测敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
             text_detection_model_name='PP-OCRv5_server_det',
