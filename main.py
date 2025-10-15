@@ -107,7 +107,7 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.9,
+            text_rec_score_thresh=0.8,
             text_det_box_thresh=0.7,
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
@@ -729,6 +729,42 @@ class VideoSubtitleExtractor:
         print(f"合并后得到 {len(segments)} 个字幕段（相似度阈值: {similarity_threshold}）")
         return segments
 
+    def generate_raw_segments(self, ocr_results: Dict[str, Dict]) -> List[Dict]:
+        """
+        生成未合并的原始字幕段（每帧一个段落）
+        用于调试和对比
+
+        Args:
+            ocr_results: OCR识别结果字典
+
+        Returns:
+            原始字幕段列表
+        """
+        if not ocr_results:
+            return []
+
+        segments = []
+        sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
+
+        for frame_path, value in sorted_results:
+            text = value['text'].strip()
+            frame_idx = value['frame_index']
+
+            if not text:
+                continue
+
+            # 每帧作为独立的段落
+            start_time = frame_idx / self.extract_fps + self.start_time
+            end_time = (frame_idx + 1) / self.extract_fps + self.start_time
+
+            segments.append({
+                'text': text,
+                'start_time': start_time,
+                'end_time': end_time
+            })
+
+        return segments
+
     def format_timestamp(self, seconds: float) -> str:
         """
         将秒数转换为SRT时间格式
@@ -769,13 +805,14 @@ class VideoSubtitleExtractor:
 
         print(f"SRT文件已保存")
 
-    def process_video(self, video_path: str, output_srt_path: str = None):
+    def process_video(self, video_path: str, output_srt_path: str = None, debug_raw: bool = False):
         """
         处理视频并生成SRT字幕
 
         Args:
             video_path: 视频文件路径
             output_srt_path: 输出SRT文件路径（可选）
+            debug_raw: 是否输出未合并的原始OCR结果（用于调试）
         """
         video_path = Path(video_path)
 
@@ -785,9 +822,11 @@ class VideoSubtitleExtractor:
         # 创建输出目录
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 确定输出文件路径
+        # 确定输出文件路径并转换为 Path 对象
         if output_srt_path is None:
             output_srt_path = self.output_dir / f"{video_path.stem}.srt"
+        else:
+            output_srt_path = Path(output_srt_path)
 
         try:
             # 步骤1: 获取视频信息
@@ -805,6 +844,14 @@ class VideoSubtitleExtractor:
             # 步骤4: 检查和优化OCR结果
             print("正在检查OCR结果...")
             ocr_results = self.check_ocr_result(ocr_results, video_info)
+
+            # 步骤4.5: 如果需要，输出原始未合并的调试文件
+            if debug_raw:
+                raw_output_path = output_srt_path.parent / f"{output_srt_path.stem}_raw.srt"
+                print(f"\n生成原始OCR调试文件: {raw_output_path}")
+                raw_segments = self.generate_raw_segments(ocr_results)
+                self.generate_srt(raw_segments, str(raw_output_path))
+                print(f"原始段落数: {len(raw_segments)} 个")
 
             # 步骤5: 合并字幕段
             segments = self.merge_subtitle_segments(ocr_results)
@@ -897,6 +944,11 @@ def main():
         default=None,
         help='处理的时长（秒），默认: None（处理到视频结束）'
     )
+    parser.add_argument(
+        '--debug-raw',
+        action='store_true',
+        help='输出未合并的原始OCR结果到 *_raw.srt 文件（用于调试）'
+    )
 
     args = parser.parse_args()
 
@@ -947,7 +999,7 @@ def main():
         return
 
     # 处理视频
-    extractor.process_video(args.video, args.output)
+    extractor.process_video(args.video, args.output, debug_raw=args.debug_raw)
 
 
 if __name__ == "__main__":
