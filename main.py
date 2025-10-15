@@ -123,7 +123,7 @@ class VideoSubtitleExtractor:
             lang='ch',
             text_rec_score_thresh=0.8,      # 识别阈值，优化后的固定值
             text_det_box_thresh=0.6,        # 检测阈值，优化后的固定值
-            text_det_thresh=0.01,            # 像素阈值，提高文本检测敏感度
+            text_det_thresh=0.3,            # 像素阈值，提高文本检测敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
@@ -667,7 +667,7 @@ class VideoSubtitleExtractor:
 
         return final_result
 
-    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, max_gap_seconds: float = 0.3) -> List[Dict]:
+    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, max_gap_seconds: float = 0.2) -> List[Dict]:
         """
         合并连续相同或相似的字幕段
 
@@ -760,8 +760,7 @@ class VideoSubtitleExtractor:
                 time_gap = (frame_idx - current_segment['end_frame']) / self.extract_fps
 
                 # 判断是否应该合并
-                should_merge = (similarity >= similarity_threshold) and \
-                              (time_gap <= max_gap_seconds or similarity >= 0.9)
+                should_merge = (similarity >= similarity_threshold) and (time_gap <= max_gap_seconds)
 
                 if should_merge:
                     # 延长当前段
