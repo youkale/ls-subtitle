@@ -450,72 +450,51 @@ class VideoSubtitleExtractor:
         results = {}
 
         # 使用进度条
-        for idx, frame_path in enumerate(tqdm(frame_files, desc="OCR识别进度", unit="帧")):
+        for idx, frame_path in enumerate(tqdm(frame_files, desc="OCR Processing", unit="FPS")):
             # 读取图片（已经是裁剪后的字幕区域）
             img = cv2.imread(str(frame_path))
             if img is None:
                 tqdm.write(f"警告: 无法读取帧 {frame_path}")
                 continue
 
-            # OCR识别 (使用PP-OCRv5模型的predict方法)
-            ocr_result = self.ocr.predict(img, use_textline_orientation=True)
+            # 使用抽象的核心OCR识别方法
+            debug_print = (idx == 0)  # 只在第一帧打印调试信息
+            if debug_print:
+                tqdm.write(f"批量识别调试: 处理帧 {frame_path.name}")
 
-            # 提取文本和边界框信息
-            text_items = []  # 存储每个文本项的信息
+            try:
+                ocr_result = self._ocr_image(img, debug_print=debug_print)
 
-            if ocr_result and len(ocr_result) > 0:
-                for item in ocr_result:
-                    if hasattr(item, 'get'):
-                        # 获取检测框
-                        dt_polys = item.get('dt_polys')  # 检测框坐标
-                        texts = item.get('rec_texts')
-                        scores = item.get('rec_scores')
+                # 如果有识别结果，保存到字典中
+                if ocr_result['texts']:
+                    # 按 x 坐标排序（从左到右）
+                    text_items = sorted(ocr_result['texts'], key=lambda x: x['box'][0])
 
-                        if texts and scores and dt_polys:
-                            for text, score, poly in zip(texts, scores, dt_polys):
-                                if score > 0.5 and text.strip():
-                                    # 计算边界框 (xmin, ymin, xmax, ymax)
-                                    x_coords = [p[0] for p in poly]
-                                    y_coords = [p[1] for p in poly]
-                                    xmin = int(min(x_coords))
-                                    xmax = int(max(x_coords))
-                                    ymin = int(min(y_coords))
-                                    ymax = int(max(y_coords))
+                    # 使用已经处理好的合并文本
+                    combined_text = ocr_result['combined_text']
 
-                                    text_items.append({
-                                        'text': text,
-                                        'score': float(score),
-                                        'box': [xmin, ymin, xmax, ymax]
-                                    })
+                    if debug_print:
+                        tqdm.write(f"批量识别调试: 最终文本 '{combined_text}'")
 
-            # 如果有识别结果，保存到字典中
-            if text_items:
-                # 按 x 坐标排序（从左到右）
-                text_items.sort(key=lambda x: x['box'][0])
+                    # 计算整体边界框
+                    if text_items:
+                        all_boxes = [item['box'] for item in text_items]
+                        xmin = min(box[0] for box in all_boxes)
+                        ymin = min(box[1] for box in all_boxes)
+                        xmax = max(box[2] for box in all_boxes)
+                        ymax = max(box[3] for box in all_boxes)
 
-                # 合并同一行的文本
-                combined_text = ''.join([item['text'] for item in text_items])
+                        results[str(frame_path)] = {
+                            'text': combined_text,
+                            'box': [xmin, ymin, xmax, ymax],
+                            'frame_index': idx,
+                            'items': text_items  # 保留原始文本项
+                        }
 
-                # 转换为简体中文
-                if combined_text:
-                    combined_text = self._convert_to_simplified(combined_text)
-                    # 去除所有空白符（空格、换行、制表符等）
-                    combined_text = ''.join(combined_text.split())
-
-                # 计算整体边界框
-                if text_items:
-                    all_boxes = [item['box'] for item in text_items]
-                    xmin = min(box[0] for box in all_boxes)
-                    ymin = min(box[1] for box in all_boxes)
-                    xmax = max(box[2] for box in all_boxes)
-                    ymax = max(box[3] for box in all_boxes)
-
-                    results[str(frame_path)] = {
-                        'text': combined_text,
-                        'box': [xmin, ymin, xmax, ymax],
-                        'frame_index': idx,
-                        'items': text_items  # 保留原始文本项
-                    }
+            except Exception as e:
+                if debug_print:
+                    tqdm.write(f"批量识别调试: OCR处理失败 {e}")
+                continue
 
         return results
 
@@ -785,6 +764,140 @@ class VideoSubtitleExtractor:
             return self.cc.convert(text)
         return text
 
+    def _ocr_image(self, img, debug_print: bool = False) -> Dict:
+        """
+        核心的单张图片OCR识别逻辑
+
+        Args:
+            img: OpenCV图片对象 (numpy.ndarray)
+            debug_print: 是否打印调试信息
+
+        Returns:
+            Dict: 包含识别结果的字典
+            {
+                'texts': [{'text': str, 'simplified_text': str, 'score': float, 'box': list}],
+                'combined_text': str,
+                'raw_result': OCRResult
+            }
+        """
+        # 进行OCR识别
+        if debug_print:
+            print("正在进行OCR识别...")
+
+        try:
+            ocr_result = self.ocr.predict(img, use_textline_orientation=True)
+
+            # 解析OCR结果
+            result_data = {
+                'texts': [],
+                'combined_text': "",
+                'raw_result': ocr_result
+            }
+
+            if ocr_result and len(ocr_result) > 0:
+                if debug_print:
+                    print(f"OCR识别完成，找到 {len(ocr_result)} 个文本区域")
+
+                for i, item in enumerate(ocr_result):
+                    # 尝试不同的方式获取数据
+                    rec_texts = []
+                    rec_scores = []
+                    boxes = []
+
+                    # 方法1: 字典方式
+                    if hasattr(item, 'get'):
+                        rec_texts = item.get('rec_texts', [])
+                        rec_scores = item.get('rec_scores', [])
+                        dt_polys = item.get('dt_polys', [])  # 检测框坐标
+
+                        # 如果有检测框，转换为边界框格式
+                        if dt_polys:
+                            for poly in dt_polys:
+                                x_coords = [p[0] for p in poly]
+                                y_coords = [p[1] for p in poly]
+                                xmin = int(min(x_coords))
+                                xmax = int(max(x_coords))
+                                ymin = int(min(y_coords))
+                                ymax = int(max(y_coords))
+                                boxes.append([xmin, ymin, xmax, ymax])
+                        else:
+                            # 尝试获取boxes字段
+                            boxes = item.get('boxes', [])
+
+                    # 方法2: 属性方式
+                    if not rec_texts:
+                        rec_texts = getattr(item, 'rec_texts', [])
+                        rec_scores = getattr(item, 'rec_scores', [])
+                        dt_polys = getattr(item, 'dt_polys', [])
+
+                        # 如果有检测框，转换为边界框格式
+                        if dt_polys:
+                            for poly in dt_polys:
+                                x_coords = [p[0] for p in poly]
+                                y_coords = [p[1] for p in poly]
+                                xmin = int(min(x_coords))
+                                xmax = int(max(x_coords))
+                                ymin = int(min(y_coords))
+                                ymax = int(max(y_coords))
+                                boxes.append([xmin, ymin, xmax, ymax])
+                        else:
+                            boxes = getattr(item, 'boxes', [])
+
+                    # 方法3: 尝试其他可能的属性名
+                    if not rec_texts:
+                        # 尝试直接访问文本内容
+                        if hasattr(item, 'text'):
+                            rec_texts = [item.text] if item.text else []
+                            rec_scores = [getattr(item, 'score', 1.0)] if item.text else []
+                        elif hasattr(item, 'texts'):
+                            rec_texts = item.texts
+                            rec_scores = getattr(item, 'scores', [1.0] * len(rec_texts))
+
+                    # 如果boxes为空，创建默认的boxes
+                    if rec_texts and (not boxes or len(boxes) != len(rec_texts)):
+                        boxes = [[0, 0, 100, 30] for _ in rec_texts]
+
+                    if rec_texts and rec_scores:
+                        for j, (text, score, box) in enumerate(zip(rec_texts, rec_scores, boxes)):
+                            if score > 0.5:  # 置信度阈值
+                                # 转换为简体中文
+                                simplified_text = self._convert_to_simplified(text)
+
+                                text_info = {
+                                    'text': text,
+                                    'simplified_text': simplified_text,
+                                    'score': float(score),
+                                    'box': box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
+                                }
+                                result_data['texts'].append(text_info)
+
+                                if debug_print:
+                                    print(f"  文本 {len(result_data['texts'])}: \"{simplified_text}\" (置信度: {score:.3f})")
+
+                # 合并所有文本
+                if result_data['texts']:
+                    # 先合并文本，然后去除所有空白符
+                    combined_text = ''.join([item['simplified_text'] for item in result_data['texts']])
+                    # 去除所有空白符（空格、换行、制表符等）
+                    combined_text = ''.join(combined_text.split())
+                    result_data['combined_text'] = combined_text
+
+                    if debug_print:
+                        print(f"\n合并文本: \"{combined_text}\"")
+                else:
+                    if debug_print:
+                        print("\n未识别到任何文本")
+            else:
+                if debug_print:
+                    print("OCR识别完成，但未找到任何文本")
+
+            return result_data
+
+        except Exception as e:
+            if debug_print:
+                print(f"OCR识别失败: {e}")
+            raise
+
     def _find_next_non_empty_text(self, segments: List[Dict], start_index: int) -> str:
         """查找下一个非空文本"""
         for i in range(start_index + 1, len(segments)):
@@ -1030,85 +1143,19 @@ class VideoSubtitleExtractor:
             print("使用完整图片进行OCR识别")
             ocr_img = img
 
-        # 进行OCR识别
-        print("正在进行OCR识别...")
+        # 使用抽象的核心OCR识别方法
         try:
-            ocr_result = self.ocr.predict(ocr_img, use_textline_orientation=True)
+            core_result = self._ocr_image(ocr_img, debug_print=True)
 
-            # 解析OCR结果
+            # 构建完整的结果数据
             result_data = {
                 'image_path': str(image_path),
                 'image_size': f"{width}x{height}",
                 'cropped': crop_region,
-                'texts': [],
-                'raw_result': ocr_result
+                'texts': core_result['texts'],
+                'combined_text': core_result['combined_text'],
+                'raw_result': core_result['raw_result']
             }
-
-            if ocr_result and len(ocr_result) > 0:
-                print(f"OCR识别完成，找到 {len(ocr_result)} 个文本区域")
-
-                for i, item in enumerate(ocr_result):
-                    # 尝试不同的方式获取数据
-                    rec_texts = []
-                    rec_scores = []
-                    boxes = []
-
-                    # 方法1: 字典方式
-                    if hasattr(item, 'get'):
-                        rec_texts = item.get('rec_texts', [])
-                        rec_scores = item.get('rec_scores', [])
-                        boxes = item.get('boxes', [])
-
-                    # 方法2: 属性方式
-                    if not rec_texts:
-                        rec_texts = getattr(item, 'rec_texts', [])
-                        rec_scores = getattr(item, 'rec_scores', [])
-                        boxes = getattr(item, 'boxes', [])
-
-                    # 方法3: 尝试其他可能的属性名
-                    if not rec_texts:
-                        # 尝试直接访问文本内容
-                        if hasattr(item, 'text'):
-                            rec_texts = [item.text] if item.text else []
-                            rec_scores = [getattr(item, 'score', 1.0)] if item.text else []
-                        elif hasattr(item, 'texts'):
-                            rec_texts = item.texts
-                            rec_scores = getattr(item, 'scores', [1.0] * len(rec_texts))
-
-                    if rec_texts and rec_scores:
-                        # 如果boxes为空，创建默认的boxes
-                        if not boxes or len(boxes) != len(rec_texts):
-                            boxes = [[[0, 0], [100, 0], [100, 30], [0, 30]] for _ in rec_texts]
-
-                        for j, (text, score, box) in enumerate(zip(rec_texts, rec_scores, boxes)):
-                            if score > 0.5:  # 置信度阈值
-                                # 转换为简体中文
-                                simplified_text = self._convert_to_simplified(text)
-
-                                text_info = {
-                                    'text': text,
-                                    'simplified_text': simplified_text,
-                                    'score': float(score),
-                                    'box': box.tolist() if hasattr(box, 'tolist') else box
-                                }
-                                result_data['texts'].append(text_info)
-
-                                print(f"  文本 {len(result_data['texts'])}: \"{simplified_text}\" (置信度: {score:.3f})")
-
-                # 合并所有文本
-                if result_data['texts']:
-                    # 先合并文本，然后去除所有空白符
-                    combined_text = ''.join([item['simplified_text'] for item in result_data['texts']])
-                    # 去除所有空白符（空格、换行、制表符等）
-                    combined_text = ''.join(combined_text.split())
-                    result_data['combined_text'] = combined_text
-                    print(f"\n合并文本: \"{combined_text}\"")
-                else:
-                    result_data['combined_text'] = ""
-                    print("\n未识别到任何文本")
-            else:
-                print("OCR识别完成，但未找到任何文本")
-                result_data['combined_text'] = ""
 
             # 保存结果到文件
             if save_result:
