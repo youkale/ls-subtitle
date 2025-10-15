@@ -121,13 +121,13 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.6,      # 识别阈值，平衡敏感度和噪声过滤
-            text_det_box_thresh=0.4,        # 检测阈值，适中设置
-            text_det_thresh=0.2,            # 像素阈值，适中敏感度
+            text_rec_score_thresh=0.7,      # 识别阈值，平衡敏感度和噪声过滤
+            text_det_box_thresh=0.5,        # 检测阈值，适中设置
+            text_det_thresh=0.01,            # 像素阈值，适中敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
-            text_detection_model_name='PP-OCRv4_server_det',
-            text_recognition_model_name='PP-OCRv4_server_rec',
-            ocr_version='PP-OCRv4',
+            text_detection_model_name='PP-OCRv5_server_det',
+            text_recognition_model_name='PP-OCRv5_server_rec',
+            ocr_version='PP-OCRv5',
             device=device  # PaddleOCR 3.2.0+ 使用device参数指定计算设备
         )
 
@@ -588,19 +588,6 @@ class VideoSubtitleExtractor:
             x_center = (xmin + xmax) / 2
             text_height = ymax - ymin
 
-            # 特殊调试：frame_000708
-            is_frame_708 = "frame_000708.jpg" in frame_path
-            if is_frame_708:
-                print(f"\n🔍 调试frame_000708过滤过程:")
-                print(f"  文本: \"{value['text']}\"")
-                print(f"  边界框: [{xmin}, {ymin}, {xmax}, {ymax}]")
-                print(f"  y_center: {y_center:.1f}, x_center: {x_center:.1f}")
-                print(f"  text_height: {text_height:.1f}")
-                print(f"  标准中心: {center:.1f} (容忍±{height_delta:.1f})")
-                print(f"  标准高度: {word_height:.1f} (容忍±{groups_tolerance:.1f})")
-                print(f"  y位置检查: {center - height_delta:.1f} < {y_center:.1f} < {center + height_delta:.1f} = {center - height_delta < y_center < center + height_delta}")
-                print(f"  高度检查: {word_height - groups_tolerance:.1f} <= {text_height:.1f} <= {word_height + groups_tolerance:.1f} = {word_height - groups_tolerance <= text_height <= word_height + groups_tolerance}")
-
             # 检查是否在字幕区域内
             if (center - height_delta < y_center < center + height_delta and
                 word_height - groups_tolerance <= text_height <= word_height + groups_tolerance):
@@ -619,12 +606,6 @@ class VideoSubtitleExtractor:
                     'box': merged_box,
                     'frame_index': value['frame_index']
                 }
-
-                if is_frame_708:
-                    print(f"  ✅ frame_000708 通过过滤，保留文本: \"{merged_text}\"")
-            else:
-                if is_frame_708:
-                    print(f"  ❌ frame_000708 被过滤掉，原因: 位置或高度不匹配")
 
         # 第三步：填充连续帧之间的空白
         if not filtered_result:
@@ -802,13 +783,14 @@ class VideoSubtitleExtractor:
             return self.cc.convert(text)
         return text
 
-    def _is_likely_subtitle_by_geometry(self, box_coords: list, text: str, debug_print: bool = False) -> bool:
+    def _is_likely_subtitle_by_geometry(self, box_coords: list, text: str, img_height: int, debug_print: bool = False) -> bool:
         """
         基于几何特征判断文本是否可能是字幕
 
         Args:
             box_coords: 文本边界框坐标 [x1, y1, x2, y2]
             text: 文本内容
+            img_height: 图片高度（用于计算相对高度）
             debug_print: 是否打印调试信息
 
         Returns:
@@ -828,7 +810,7 @@ class VideoSubtitleExtractor:
         # 计算几何特征
         aspect_ratio = width / height
         avg_char_width = width / char_count
-        relative_height = height / 480  # 假设图片高度480px（裁剪后的字幕区域）
+        relative_height = height / img_height  # 使用实际图片高度计算相对高度
 
         # 基于分析结果的过滤规则
         is_wide_text = aspect_ratio > 1.6  # 宽高比大于1.6（字幕通常更宽扁）
@@ -887,6 +869,9 @@ class VideoSubtitleExtractor:
                 'raw_result': OCRResult
             }
         """
+        # 获取图片高度用于几何特征计算
+        img_height = img.shape[0] if img is not None and hasattr(img, 'shape') else 480
+
         # 进行OCR识别
         if debug_print:
             print("正在进行OCR识别...")
@@ -977,7 +962,7 @@ class VideoSubtitleExtractor:
                             if score > 0.5:  # 置信度阈值
                                 # 几何特征过滤
                                 box_coords = box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
-                                if self._is_likely_subtitle_by_geometry(box_coords, text, debug_print):
+                                if self._is_likely_subtitle_by_geometry(box_coords, text, img_height, debug_print):
                                     # 转换为简体中文
                                     simplified_text = self._convert_to_simplified(text)
 
