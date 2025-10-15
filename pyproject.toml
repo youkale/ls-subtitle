@@ -10,6 +10,7 @@ dependencies = [
     "pillow>=10.0.0",
     "numpy>=1.24.0",
     "tqdm>=4.66.0",
+    "opencc-python-reimplemented>=0.1.7",
 ]
 
 

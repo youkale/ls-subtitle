@@ -221,6 +221,25 @@ python main.py <视频文件路径> -o output.srt
 python main.py <视频文件路径> --output-dir ./my_output
 ```
 
+### 单张图片OCR识别（调试功能）
+
+```bash
+# 识别整张图片
+python main.py --ocr-image frame_000123.jpg
+
+# 只识别字幕区域（推荐）
+python main.py --ocr-image frame_000123.jpg --crop-region
+
+# 保存识别结果到文件
+python main.py --ocr-image frame_000123.jpg --crop-region --save-result
+
+# 使用CPU模式
+python main.py --ocr-image frame_000123.jpg --cpu
+
+# 验证缺失文本的帧文件
+python main.py --ocr-image output/frames/frame_000378.jpg --crop-region --save-result
+```
+
 ### 自定义提取帧率
 
 ```bash

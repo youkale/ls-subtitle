@@ -11,6 +11,12 @@ from tqdm import tqdm
 import numpy as np
 from difflib import SequenceMatcher
 
+try:
+    from opencc import OpenCC
+    HAS_OPENCC = True
+except ImportError:
+    HAS_OPENCC = False
+
 
 def get_groups_mean(arr: list, tolerance: float = 20) -> float:
     """
@@ -88,6 +94,14 @@ class VideoSubtitleExtractor:
         self.use_gpu = use_gpu
         self.start_time = start_time
         self.duration = duration
+
+        # 初始化繁体转简体转换器
+        if HAS_OPENCC:
+            self.cc = OpenCC('t2s')  # 繁体转简体
+            print("已启用繁体转简体功能")
+        else:
+            self.cc = None
+            print("未安装opencc，将跳过繁体转简体转换")
 
         # 检测GPU可用性并设置设备
         if use_gpu:
@@ -480,7 +494,13 @@ class VideoSubtitleExtractor:
                 text_items.sort(key=lambda x: x['box'][0])
 
                 # 合并同一行的文本
-                combined_text = ' '.join([item['text'] for item in text_items])
+                combined_text = ''.join([item['text'] for item in text_items])
+
+                # 转换为简体中文
+                if combined_text:
+                    combined_text = self._convert_to_simplified(combined_text)
+                    # 去除所有空白符（空格、换行、制表符等）
+                    combined_text = ''.join(combined_text.split())
 
                 # 计算整体边界框
                 if text_items:
@@ -629,16 +649,20 @@ class VideoSubtitleExtractor:
 
         return final_result
 
-    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8) -> List[Dict]:
+    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, max_gap_seconds: float = 0.3) -> List[Dict]:
         """
         合并连续相同或相似的字幕段
 
-        使用文本相似度算法（而不是精确匹配）来合并字幕，
-        可以处理 OCR 识别误差导致的同一句话被分割的问题。
+        改进的合并算法，解决以下问题：
+        1. 空文本强制分割问题 - 使用时间间隔判断
+        2. 相似度阈值优化 - 降低到0.75以处理更多OCR错误
+        3. 时间间隔合并 - 短时间内的相同文本会被合并
+        4. 标点符号处理 - 忽略标点符号差异
 
         Args:
             ocr_results: OCR识别结果字典
-            similarity_threshold: 文本相似度阈值（0.0-1.0），默认0.8
+            similarity_threshold: 文本相似度阈值（0.0-1.0），默认0.75
+            max_gap_seconds: 最大时间间隔（秒），默认0.5秒
 
         Returns:
             合并后的字幕段列表
@@ -646,32 +670,63 @@ class VideoSubtitleExtractor:
         if not ocr_results:
             return []
 
-        print("正在合并字幕段（使用相似度匹配）...")
+        print(f"正在合并字幕段（相似度阈值: {similarity_threshold}, 最大间隔: {max_gap_seconds}秒）...")
 
         # 按帧索引排序
         sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
 
-        segments = []
-        current_segment = None
-        text_variants = []  # 存储当前段的所有文本变体
-
+        # 第一步：创建初始段落（包含空文本段）
+        initial_segments = []
         for frame_path, value in sorted_results:
             text = value['text'].strip()
             frame_idx = value['frame_index']
 
-            if not text:
-                # 空文本，结束当前段
-                if current_segment:
-                    # 选择出现次数最多的文本作为最终文本
-                    final_text = max(set(text_variants), key=text_variants.count)
-                    current_segment['text'] = final_text
-                    segments.append(current_segment)
+            initial_segments.append({
+                'frame_index': frame_idx,
+                'text': text,
+                'is_empty': not text
+            })
+
+        # 第二步：智能合并算法
+        segments = []
+        current_segment = None
+        text_variants = []
+
+        for i, seg in enumerate(initial_segments):
+            text = seg['text']
+            frame_idx = seg['frame_index']
+            is_empty = seg['is_empty']
+
+            # 如果是空文本，检查是否应该跳过（基于时间间隔）
+            if is_empty:
+                if current_segment is not None:
+                    # 计算时间间隔
+                    time_gap = (frame_idx - current_segment['end_frame']) / self.extract_fps
+
+                    # 如果时间间隔很小，跳过这个空文本
+                    if time_gap <= max_gap_seconds:
+                        # 查看下一个非空文本是否与当前段相似
+                        next_text = self._find_next_non_empty_text(initial_segments, i)
+                        if next_text and current_segment:
+                            current_text = self._normalize_text(current_segment['text'])
+                            next_normalized = self._normalize_text(next_text)
+                            similarity = text_similarity(current_text, next_normalized)
+
+                            if similarity >= similarity_threshold:
+                                # 跳过这个空文本，继续当前段
+                                continue
+
+                    # 否则结束当前段
+                    self._finalize_current_segment(current_segment, text_variants, segments)
                     current_segment = None
                     text_variants = []
                 continue
 
-            # 如果是第一个段
+            # 处理非空文本
+            normalized_text = self._normalize_text(text)
+
             if current_segment is None:
+                # 开始新段
                 current_segment = {
                     'start_frame': frame_idx,
                     'end_frame': frame_idx,
@@ -679,32 +734,25 @@ class VideoSubtitleExtractor:
                 }
                 text_variants = [text]
             else:
-                # 计算与当前段文本的相似度
-                current_text = current_segment['text']
-                similarity = text_similarity(text, current_text)
+                # 计算与当前段的相似度
+                current_normalized = self._normalize_text(current_segment['text'])
+                similarity = text_similarity(normalized_text, current_normalized)
 
-                # 如果相似度超过阈值，认为是同一句话
-                if similarity >= similarity_threshold:
+                # 计算时间间隔
+                time_gap = (frame_idx - current_segment['end_frame']) / self.extract_fps
+
+                # 判断是否应该合并
+                should_merge = (similarity >= similarity_threshold) and \
+                              (time_gap <= max_gap_seconds or similarity >= 0.9)
+
+                if should_merge:
                     # 延长当前段
                     current_segment['end_frame'] = frame_idx
                     text_variants.append(text)
                 else:
-                    # 不同的文本，保存当前段并开始新段
-                    # 选择出现次数最多的文本作为最终文本
-                    final_text = max(set(text_variants), key=text_variants.count)
-                    current_segment['text'] = final_text
+                    # 结束当前段，开始新段
+                    self._finalize_current_segment(current_segment, text_variants, segments)
 
-                    # 计算时间戳
-                    start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
-                    end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
-
-                    segments.append({
-                        'text': final_text,
-                        'start_time': start_time,
-                        'end_time': end_time
-                    })
-
-                    # 开始新段
                     current_segment = {
                         'start_frame': frame_idx,
                         'end_frame': frame_idx,
@@ -714,20 +762,81 @@ class VideoSubtitleExtractor:
 
         # 保存最后一段
         if current_segment:
-            final_text = max(set(text_variants), key=text_variants.count) if text_variants else current_segment['text']
-            current_segment['text'] = final_text
+            self._finalize_current_segment(current_segment, text_variants, segments)
 
-            start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
-            end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
-
-            segments.append({
-                'text': final_text,
-                'start_time': start_time,
-                'end_time': end_time
-            })
-
-        print(f"合并后得到 {len(segments)} 个字幕段（相似度阈值: {similarity_threshold}）")
+        print(f"合并后得到 {len(segments)} 个字幕段")
         return segments
+
+    def _normalize_text(self, text: str) -> str:
+        """标准化文本，繁体转简体，去除标点符号和空格，用于相似度比较"""
+        import re
+
+        # 1. 繁体转简体
+        if self.cc and text:
+            text = self.cc.convert(text)
+
+        # 2. 去除标点符号和空格
+        normalized = re.sub(r'[^\w\u4e00-\u9fff]', '', text)
+        return normalized.lower()
+
+    def _convert_to_simplified(self, text: str) -> str:
+        """将文本转换为简体中文"""
+        if self.cc and text:
+            return self.cc.convert(text)
+        return text
+
+    def _find_next_non_empty_text(self, segments: List[Dict], start_index: int) -> str:
+        """查找下一个非空文本"""
+        for i in range(start_index + 1, len(segments)):
+            if not segments[i]['is_empty']:
+                return segments[i]['text']
+        return ""
+
+    def _is_likely_same_text(self, text1: str, text2: str) -> bool:
+        """判断两个文本是否可能是同一句话（考虑OCR常见错误）"""
+        if not text1 or not text2:
+            return False
+
+        # 长度差异太大，不太可能是同一句话
+        if abs(len(text1) - len(text2)) > max(len(text1), len(text2)) * 0.3:
+            return False
+
+        # 检查是否有足够的共同字符
+        common_chars = set(text1) & set(text2)
+        min_len = min(len(text1), len(text2))
+
+        return len(common_chars) >= min_len * 0.6
+
+    def _finalize_current_segment(self, current_segment: Dict, text_variants: List[str], segments: List[Dict]):
+        """完成当前段落并添加到结果中"""
+        if not current_segment:
+            return
+
+        # 选择最佳文本（出现次数最多，或最长的）
+        if text_variants:
+            # 优先选择出现次数最多的
+            text_counts = {}
+            for text in text_variants:
+                normalized = self._normalize_text(text)
+                if normalized not in text_counts:
+                    text_counts[normalized] = []
+                text_counts[normalized].append(text)
+
+            # 选择出现次数最多的组，然后选择该组中最长的文本
+            best_group = max(text_counts.values(), key=len)
+            final_text = max(best_group, key=len)
+        else:
+            final_text = current_segment['text']
+
+        # 计算时间戳
+        start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
+        end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
+
+        segments.append({
+            'text': final_text,
+            'start_time': start_time,
+            'end_time': end_time
+        })
 
     def generate_raw_segments(self, ocr_results: Dict[str, Dict]) -> List[Dict]:
         """
@@ -869,16 +978,196 @@ class VideoSubtitleExtractor:
             print(f"处理失败: {e}")
             raise
 
+    def ocr_single_image(self, image_path: str, crop_region: bool = False, save_result: bool = False) -> Dict:
+        """
+        对单张图片进行OCR识别
+
+        Args:
+            image_path: 图片文件路径
+            crop_region: 是否裁剪到字幕区域
+            save_result: 是否保存结果到文件
+
+        Returns:
+            OCR识别结果
+        """
+        import cv2
+        from pathlib import Path
+
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"图片文件不存在: {image_path}")
+
+        print(f"正在识别图片: {image_path}")
+
+        # 读取图片
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError(f"无法读取图片文件: {image_path}")
+
+        height, width = img.shape[:2]
+        print(f"图片尺寸: {width}x{height}")
+
+        # 如果需要裁剪到字幕区域
+        if crop_region:
+            # 计算字幕区域
+            bottom_y = int(height * (1 - self.subtitle_region_bottom))
+            top_y = int(height * (1 - self.subtitle_region_top))
+            crop_height = bottom_y - top_y
+
+            print(f"字幕区域: y={top_y} 到 y={bottom_y} (高度={crop_height}px, 占比{self.subtitle_region_bottom*100:.1f}%-{self.subtitle_region_top*100:.1f}%)")
+
+            # 裁剪图片
+            cropped_img = img[top_y:bottom_y, 0:width]
+
+            # 保存裁剪后的图片用于调试
+            crop_path = image_path.parent / f"{image_path.stem}_cropped{image_path.suffix}"
+            cv2.imwrite(str(crop_path), cropped_img)
+            print(f"裁剪后的图片已保存到: {crop_path}")
+
+            # 使用裁剪后的图片进行OCR
+            ocr_img = cropped_img
+        else:
+            print("使用完整图片进行OCR识别")
+            ocr_img = img
+
+        # 进行OCR识别
+        print("正在进行OCR识别...")
+        try:
+            ocr_result = self.ocr.predict(ocr_img, use_textline_orientation=True)
+
+            # 解析OCR结果
+            result_data = {
+                'image_path': str(image_path),
+                'image_size': f"{width}x{height}",
+                'cropped': crop_region,
+                'texts': [],
+                'raw_result': ocr_result
+            }
+
+            if ocr_result and len(ocr_result) > 0:
+                print(f"OCR识别完成，找到 {len(ocr_result)} 个文本区域")
+
+                for i, item in enumerate(ocr_result):
+                    # 尝试不同的方式获取数据
+                    rec_texts = []
+                    rec_scores = []
+                    boxes = []
+
+                    # 方法1: 字典方式
+                    if hasattr(item, 'get'):
+                        rec_texts = item.get('rec_texts', [])
+                        rec_scores = item.get('rec_scores', [])
+                        boxes = item.get('boxes', [])
+
+                    # 方法2: 属性方式
+                    if not rec_texts:
+                        rec_texts = getattr(item, 'rec_texts', [])
+                        rec_scores = getattr(item, 'rec_scores', [])
+                        boxes = getattr(item, 'boxes', [])
+
+                    # 方法3: 尝试其他可能的属性名
+                    if not rec_texts:
+                        # 尝试直接访问文本内容
+                        if hasattr(item, 'text'):
+                            rec_texts = [item.text] if item.text else []
+                            rec_scores = [getattr(item, 'score', 1.0)] if item.text else []
+                        elif hasattr(item, 'texts'):
+                            rec_texts = item.texts
+                            rec_scores = getattr(item, 'scores', [1.0] * len(rec_texts))
+
+                    if rec_texts and rec_scores:
+                        # 如果boxes为空，创建默认的boxes
+                        if not boxes or len(boxes) != len(rec_texts):
+                            boxes = [[[0, 0], [100, 0], [100, 30], [0, 30]] for _ in rec_texts]
+
+                        for j, (text, score, box) in enumerate(zip(rec_texts, rec_scores, boxes)):
+                            if score > 0.5:  # 置信度阈值
+                                # 转换为简体中文
+                                simplified_text = self._convert_to_simplified(text)
+
+                                text_info = {
+                                    'text': text,
+                                    'simplified_text': simplified_text,
+                                    'score': float(score),
+                                    'box': box.tolist() if hasattr(box, 'tolist') else box
+                                }
+                                result_data['texts'].append(text_info)
+
+                                print(f"  文本 {len(result_data['texts'])}: \"{simplified_text}\" (置信度: {score:.3f})")
+
+                # 合并所有文本
+                if result_data['texts']:
+                    # 先合并文本，然后去除所有空白符
+                    combined_text = ''.join([item['simplified_text'] for item in result_data['texts']])
+                    # 去除所有空白符（空格、换行、制表符等）
+                    combined_text = ''.join(combined_text.split())
+                    result_data['combined_text'] = combined_text
+                    print(f"\n合并文本: \"{combined_text}\"")
+                else:
+                    result_data['combined_text'] = ""
+                    print("\n未识别到任何文本")
+            else:
+                print("OCR识别完成，但未找到任何文本")
+                result_data['combined_text'] = ""
+
+            # 保存结果到文件
+            if save_result:
+                result_file = image_path.parent / f"{image_path.stem}_ocr_result.json"
+
+                # 创建可序列化的结果
+                save_data = {
+                    'image_path': result_data['image_path'],
+                    'image_size': result_data['image_size'],
+                    'cropped': result_data['cropped'],
+                    'combined_text': result_data['combined_text'],
+                    'texts': result_data['texts'],
+                    'text_count': len(result_data['texts'])
+                }
+
+                import json
+                with open(result_file, 'w', encoding='utf-8') as f:
+                    json.dump(save_data, f, ensure_ascii=False, indent=2)
+
+                print(f"识别结果已保存到: {result_file}")
+
+                # 同时保存简单的文本文件
+                text_file = image_path.parent / f"{image_path.stem}_ocr_result.txt"
+                with open(text_file, 'w', encoding='utf-8') as f:
+                    f.write(f"图片: {image_path}\n")
+                    f.write(f"尺寸: {result_data['image_size']}\n")
+                    f.write(f"裁剪: {'是' if crop_region else '否'}\n")
+                    f.write(f"识别文本数: {len(result_data['texts'])}\n\n")
+                    f.write(f"合并文本: {result_data['combined_text']}\n\n")
+                    f.write("详细结果:\n")
+                    for i, text_info in enumerate(result_data['texts'], 1):
+                        f.write(f"{i}. \"{text_info['simplified_text']}\" (置信度: {text_info['score']:.3f})\n")
+
+                print(f"文本结果已保存到: {text_file}")
+
+            return result_data
+
+        except Exception as e:
+            print(f"OCR识别失败: {e}")
+            raise
+
 
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
         description='使用PaddleOCR从视频中提取字幕并生成SRT文件'
     )
-    parser.add_argument(
+    # 创建互斥组：视频处理 vs 单图OCR
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
         'video',
+        nargs='?',
         type=str,
         help='输入视频文件路径'
+    )
+    group.add_argument(
+        '--ocr-image',
+        type=str,
+        help='单张图片OCR识别模式：指定图片文件路径'
     )
     parser.add_argument(
         '-o', '--output',
@@ -949,8 +1238,62 @@ def main():
         action='store_true',
         help='输出未合并的原始OCR结果到 *_raw.srt 文件（用于调试）'
     )
+    parser.add_argument(
+        '--crop-region',
+        action='store_true',
+        help='单图OCR模式：是否裁剪到字幕区域（默认处理整张图片）'
+    )
+    parser.add_argument(
+        '--save-result',
+        action='store_true',
+        help='单图OCR模式：保存识别结果到文本文件'
+    )
 
     args = parser.parse_args()
+
+    # 检查是否是单图OCR模式
+    if args.ocr_image:
+        print("=" * 50)
+        print("单张图片OCR识别模式")
+        print("=" * 50)
+
+        # 创建提取器（用于OCR功能）
+        extractor = VideoSubtitleExtractor(
+            output_dir=args.output_dir,
+            extract_fps=args.fps,
+            subtitle_region_bottom=args.subtitle_bottom,
+            subtitle_region_top=args.subtitle_top,
+            use_gpu=not args.cpu,
+            start_time=0,
+            duration=None
+        )
+
+        try:
+            # 执行单图OCR
+            result = extractor.ocr_single_image(
+                image_path=args.ocr_image,
+                crop_region=args.crop_region,
+                save_result=args.save_result
+            )
+
+            print("\n" + "=" * 50)
+            print("OCR识别完成")
+            print("=" * 50)
+
+            if result['combined_text']:
+                print(f"✓ 识别成功: \"{result['combined_text']}\"")
+            else:
+                print("✗ 未识别到任何文本")
+
+        except Exception as e:
+            print(f"✗ OCR识别失败: {e}")
+            return 1
+
+        return 0
+
+    # 验证视频模式的参数
+    if not args.video:
+        parser.error("视频模式需要提供视频文件路径")
 
     # 验证字幕区域参数
     if args.subtitle_bottom < 0 or args.subtitle_bottom > 1:
