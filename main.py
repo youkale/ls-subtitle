@@ -73,7 +73,8 @@ class VideoSubtitleExtractor:
 
     def __init__(self, output_dir: str = "output", extract_fps: int = 30,
                  subtitle_region_bottom: float = 0.1, subtitle_region_top: float = 0.45,
-                 use_gpu: bool = True, start_time: float = 0, duration: float = None):
+                 use_gpu: bool = True, start_time: float = 0, duration: float = None,
+                 ocr_rec_thresh: float = 0.5, ocr_det_thresh: float = 0.3):
         """
         初始化字幕提取器
 
@@ -117,12 +118,14 @@ class VideoSubtitleExtractor:
             print("使用CPU模式进行OCR识别")
             device = 'cpu'
 
-        # 使用 PP-OCRv5 模型
+        # 使用 PP-OCRv5 模型，优化参数以提高识别效果
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.8,
-            text_det_box_thresh=0.7,
+            text_rec_score_thresh=ocr_rec_thresh,  # 识别阈值，可通过参数调整
+            text_det_box_thresh=ocr_det_thresh,    # 检测阈值，可通过参数调整
+            text_det_thresh=0.1,                   # 像素阈值，提高文本检测敏感度
+            text_det_unclip_ratio=2.5,             # 扩张系数，扩大文本检测区域
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
             ocr_version='PP-OCRv5',
@@ -808,21 +811,26 @@ class VideoSubtitleExtractor:
                     if hasattr(item, 'get'):
                         rec_texts = item.get('rec_texts', [])
                         rec_scores = item.get('rec_scores', [])
-                        dt_polys = item.get('dt_polys', [])  # 检测框坐标
 
-                        # 如果有检测框，转换为边界框格式
-                        if dt_polys:
-                            for poly in dt_polys:
-                                x_coords = [p[0] for p in poly]
-                                y_coords = [p[1] for p in poly]
-                                xmin = int(min(x_coords))
-                                xmax = int(max(x_coords))
-                                ymin = int(min(y_coords))
-                                ymax = int(max(y_coords))
-                                boxes.append([xmin, ymin, xmax, ymax])
+                        # 优先使用现成的 rec_boxes
+                        rec_boxes = item.get('rec_boxes')
+                        if rec_boxes is not None and hasattr(rec_boxes, 'shape'):
+                            boxes = rec_boxes.tolist()
                         else:
-                            # 尝试获取boxes字段
-                            boxes = item.get('boxes', [])
+                            # 备选方案：从 dt_polys 计算边界框
+                            dt_polys = item.get('dt_polys', [])
+                            if dt_polys:
+                                for poly in dt_polys:
+                                    x_coords = [p[0] for p in poly]
+                                    y_coords = [p[1] for p in poly]
+                                    xmin = int(min(x_coords))
+                                    xmax = int(max(x_coords))
+                                    ymin = int(min(y_coords))
+                                    ymax = int(max(y_coords))
+                                    boxes.append([xmin, ymin, xmax, ymax])
+                            else:
+                                # 最后尝试获取boxes字段
+                                boxes = item.get('boxes', [])
 
                     # 方法2: 属性方式
                     if not rec_texts:
@@ -859,6 +867,9 @@ class VideoSubtitleExtractor:
 
                     if rec_texts and rec_scores:
                         for j, (text, score, box) in enumerate(zip(rec_texts, rec_scores, boxes)):
+                            if debug_print:
+                                print(f"  检测到文本 {j+1}: \"{text}\" (置信度: {score:.3f})")
+
                             if score > 0.5:  # 置信度阈值
                                 # 转换为简体中文
                                 simplified_text = self._convert_to_simplified(text)
@@ -872,7 +883,10 @@ class VideoSubtitleExtractor:
                                 result_data['texts'].append(text_info)
 
                                 if debug_print:
-                                    print(f"  文本 {len(result_data['texts'])}: \"{simplified_text}\" (置信度: {score:.3f})")
+                                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
+                            else:
+                                if debug_print:
+                                    print(f"    ✗ 跳过: 置信度过低 ({score:.3f} < 0.5)")
 
                 # 合并所有文本
                 if result_data['texts']:
@@ -1295,6 +1309,18 @@ def main():
         action='store_true',
         help='单图OCR模式：保存识别结果到文本文件'
     )
+    parser.add_argument(
+        '--ocr-rec-thresh',
+        type=float,
+        default=0.5,
+        help='OCR识别阈值，越低越敏感（默认: 0.5，范围: 0.1-0.9）'
+    )
+    parser.add_argument(
+        '--ocr-det-thresh',
+        type=float,
+        default=0.3,
+        help='OCR检测阈值，越低越敏感（默认: 0.3，范围: 0.1-0.9）'
+    )
 
     args = parser.parse_args()
 
@@ -1312,7 +1338,9 @@ def main():
             subtitle_region_top=args.subtitle_top,
             use_gpu=not args.cpu,
             start_time=0,
-            duration=None
+            duration=None,
+            ocr_rec_thresh=args.ocr_rec_thresh,
+            ocr_det_thresh=args.ocr_det_thresh
         )
 
         try:
@@ -1364,7 +1392,9 @@ def main():
         subtitle_region_top=args.subtitle_top,
         use_gpu=not args.cpu,  # 如果指定 --cpu 则不使用GPU
         start_time=args.start_time,
-        duration=args.duration
+        duration=args.duration,
+        ocr_rec_thresh=args.ocr_rec_thresh,
+        ocr_det_thresh=args.ocr_det_thresh
     )
 
     # 如果是预览模式
