@@ -1360,22 +1360,23 @@ def main():
 
     args = parser.parse_args()
 
+# 创建提取器（用于OCR功能）
+    extractor = VideoSubtitleExtractor(
+        output_dir=args.output_dir,
+        extract_fps=args.fps,
+        subtitle_region_bottom=args.subtitle_bottom,
+        subtitle_region_top=args.subtitle_top,
+        use_gpu=not args.cpu,
+        start_time=0,
+        duration=None
+    )
+
     # 检查是否是单图OCR模式
     if args.ocr_image:
         print("=" * 50)
         print("单张图片OCR识别模式")
         print("=" * 50)
 
-        # 创建提取器（用于OCR功能）
-        extractor = VideoSubtitleExtractor(
-            output_dir=args.output_dir,
-            extract_fps=args.fps,
-            subtitle_region_bottom=args.subtitle_bottom,
-            subtitle_region_top=args.subtitle_top,
-            use_gpu=not args.cpu,
-            start_time=0,
-            duration=None
-        )
 
         try:
             # 执行单图OCR
@@ -1417,17 +1418,6 @@ def main():
         parser.error("--start-time 必须 >= 0")
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration 必须 > 0")
-
-    # 创建提取器
-    extractor = VideoSubtitleExtractor(
-        output_dir=args.output_dir,
-        extract_fps=args.fps,
-        subtitle_region_bottom=args.subtitle_bottom,
-        subtitle_region_top=args.subtitle_top,
-        use_gpu=not args.cpu,  # 如果指定 --cpu 则不使用GPU
-        start_time=args.start_time,
-        duration=args.duration
-    )
 
     # 如果是预览模式
     if args.preview:
