@@ -123,7 +123,7 @@ class VideoSubtitleExtractor:
             lang='ch',
             text_rec_score_thresh=0.8,      # 识别阈值，优化后的固定值
             text_det_box_thresh=0.6,        # 检测阈值，优化后的固定值
-            text_det_thresh=0.1,            # 像素阈值，提高文本检测敏感度
+            text_det_thresh=0.01,            # 像素阈值，提高文本检测敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
