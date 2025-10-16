@@ -663,10 +663,11 @@ class VideoSubtitleExtractor:
 
     def _merge_similar_segments(self, filtered_frames: List[Dict],
                                similarity_threshold: float) -> List[Dict]:
-        """智能相似度合并"""
+        """智能相似度合并（帧级别 + 段落级别）"""
         print(f"\n[步骤 2/3] 智能相似度合并")
         print(f"  - 2-4字短文本智能识别")
         print(f"  - 置信度优先选择")
+        print(f"  - 段落级别二次合并")
 
         merged_segments = []
         current_segment = None
@@ -685,7 +686,8 @@ class VideoSubtitleExtractor:
                     'start_frame': frame_idx,
                     'end_frame': frame_idx,
                     'text': text,
-                    'frame_indices': [frame_idx]
+                    'frame_indices': [frame_idx],
+                    'text_variants': [{'text': text, 'confidence': confidence}]
                 }
                 text_variants = [{'text': text, 'confidence': confidence}]
             else:
@@ -696,22 +698,76 @@ class VideoSubtitleExtractor:
                 if should_merge:
                     current_segment['end_frame'] = frame_idx
                     current_segment['frame_indices'].append(frame_idx)
+                    current_segment['text_variants'].append({'text': text, 'confidence': confidence})
                     text_variants.append({'text': text, 'confidence': confidence})
                 else:
+                    # 完成当前段落，选择最佳文本
                     current_segment['text'] = self._select_best_text_from_variants(text_variants)
-                    merged_segments.append(current_segment)
 
+                    # 尝试与已存在的最后一个段落合并（段落级别合并）
+                    if merged_segments:
+                        last_segment = merged_segments[-1]
+                        # 检查与最后一个段落的相似度和时间连续性
+                        should_merge_with_last = self._should_merge_segments(
+                            last_segment, current_segment['start_frame'],
+                            current_segment['text'], similarity_threshold
+                        )
+
+                        if should_merge_with_last:
+                            # 合并到最后一个段落：扩展帧范围，合并text_variants
+                            last_segment['end_frame'] = current_segment['end_frame']
+                            if 'frame_indices' in last_segment and 'frame_indices' in current_segment:
+                                last_segment['frame_indices'].extend(current_segment['frame_indices'])
+                            # 合并所有text_variants
+                            if 'text_variants' in last_segment and 'text_variants' in current_segment:
+                                last_segment['text_variants'].extend(current_segment['text_variants'])
+                            # 重新选择最佳文本（基于所有variants）
+                            last_segment['text'] = self._select_best_text_from_variants(last_segment['text_variants'])
+                        else:
+                            # 添加为新段落
+                            merged_segments.append(current_segment)
+                    else:
+                        # 第一个段落，直接添加
+                        merged_segments.append(current_segment)
+
+                    # 开始新段落
                     current_segment = {
                         'start_frame': frame_idx,
                         'end_frame': frame_idx,
                         'text': text,
-                        'frame_indices': [frame_idx]
+                        'frame_indices': [frame_idx],
+                        'text_variants': [{'text': text, 'confidence': confidence}]
                     }
                     text_variants = [{'text': text, 'confidence': confidence}]
 
+        # 处理最后一个段落
         if current_segment:
             current_segment['text'] = self._select_best_text_from_variants(text_variants)
-            merged_segments.append(current_segment)
+
+            # 尝试与已存在的最后一个段落合并
+            if merged_segments:
+                last_segment = merged_segments[-1]
+                should_merge_with_last = self._should_merge_segments(
+                    last_segment, current_segment['start_frame'],
+                    current_segment['text'], similarity_threshold
+                )
+
+                if should_merge_with_last:
+                    last_segment['end_frame'] = current_segment['end_frame']
+                    if 'frame_indices' in last_segment and 'frame_indices' in current_segment:
+                        last_segment['frame_indices'].extend(current_segment['frame_indices'])
+                    if 'text_variants' in last_segment and 'text_variants' in current_segment:
+                        last_segment['text_variants'].extend(current_segment['text_variants'])
+                    last_segment['text'] = self._select_best_text_from_variants(last_segment['text_variants'])
+                else:
+                    merged_segments.append(current_segment)
+            else:
+                merged_segments.append(current_segment)
+
+        # 清理临时字段
+        for seg in merged_segments:
+            if 'text_variants' in seg:
+                del seg['text_variants']
 
         return merged_segments
 
