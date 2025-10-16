@@ -68,6 +68,127 @@ def text_similarity(text1: str, text2: str) -> float:
     return SequenceMatcher(None, text1, text2).ratio()
 
 
+# ============ 纯函数：OCR数据处理 ============
+
+def _convert_poly_to_box(poly: list) -> list:
+    """将多边形坐标转换为边界框格式 [xmin, ymin, xmax, ymax]"""
+    x_coords = [p[0] for p in poly]
+    y_coords = [p[1] for p in poly]
+    return [int(min(x_coords)), int(min(y_coords)),
+            int(max(x_coords)), int(max(y_coords))]
+
+
+def _extract_texts_scores_boxes_from_dict(item: dict) -> tuple:
+    """从字典格式的OCR结果中提取数据"""
+    rec_texts = item.get('rec_texts', [])
+    rec_scores = item.get('rec_scores', [])
+    boxes = []
+
+    rec_boxes = item.get('rec_boxes')
+    if rec_boxes is not None and hasattr(rec_boxes, 'shape'):
+        boxes = rec_boxes.tolist()
+    else:
+        dt_polys = item.get('dt_polys', [])
+        if dt_polys:
+            boxes = [_convert_poly_to_box(poly) for poly in dt_polys]
+        else:
+            boxes = item.get('boxes', [])
+
+    return rec_texts, rec_scores, boxes
+
+
+def _extract_texts_scores_boxes_from_object(item) -> tuple:
+    """从对象属性格式的OCR结果中提取数据"""
+    rec_texts = getattr(item, 'rec_texts', [])
+    rec_scores = getattr(item, 'rec_scores', [])
+    dt_polys = getattr(item, 'dt_polys', [])
+
+    if dt_polys:
+        boxes = [_convert_poly_to_box(poly) for poly in dt_polys]
+    else:
+        boxes = getattr(item, 'boxes', [])
+
+    return rec_texts, rec_scores, boxes
+
+
+def _extract_texts_scores_boxes_fallback(item) -> tuple:
+    """尝试其他可能的方式提取数据（fallback）"""
+    if hasattr(item, 'text'):
+        text = item.text
+        rec_texts = [text] if text else []
+        rec_scores = [getattr(item, 'score', 1.0)] if text else []
+        boxes = []
+    elif hasattr(item, 'texts'):
+        rec_texts = item.texts
+        rec_scores = getattr(item, 'scores', [1.0] * len(rec_texts))
+        boxes = []
+    else:
+        rec_texts, rec_scores, boxes = [], [], []
+
+    return rec_texts, rec_scores, boxes
+
+
+def _extract_ocr_data_from_item(item) -> tuple:
+    """
+    从OCR结果项中提取文本、分数和边界框（纯函数）
+
+    统一处理不同格式的OCR结果，提取标准化数据
+
+    Args:
+        item: OCR结果项（可能是字典或对象）
+
+    Returns:
+        (rec_texts, rec_scores, boxes) 元组
+    """
+    rec_texts, rec_scores, boxes = [], [], []
+
+    if hasattr(item, 'get'):
+        rec_texts, rec_scores, boxes = _extract_texts_scores_boxes_from_dict(item)
+
+    if not rec_texts:
+        rec_texts, rec_scores, boxes = _extract_texts_scores_boxes_from_object(item)
+
+    if not rec_texts:
+        rec_texts, rec_scores, boxes = _extract_texts_scores_boxes_fallback(item)
+
+    if rec_texts and (not boxes or len(boxes) != len(rec_texts)):
+        boxes = [[0, 0, 100, 30] for _ in rec_texts]
+
+    return rec_texts, rec_scores, boxes
+
+
+def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio: float = 0.15) -> tuple:
+    """
+    检查文本框是否在图片中心区域（纯函数）
+
+    Args:
+        box_coords: 边界框坐标 [xmin, ymin, xmax, ymax]
+        img_width: 图片宽度
+        tolerance_ratio: 容忍度比例（默认15%）
+
+    Returns:
+        (is_in_center, center_x, img_center_x, tolerance) 元组
+    """
+    center_x = (box_coords[0] + box_coords[2]) / 2
+    img_center_x = img_width / 2
+    tolerance = img_width * tolerance_ratio
+    is_in_center = abs(center_x - img_center_x) <= tolerance
+
+    return is_in_center, center_x, img_center_x, tolerance
+
+
+def _normalize_box_coords(box) -> list:
+    """规范化边界框坐标（纯函数）"""
+    if isinstance(box, list):
+        return box
+    elif hasattr(box, 'tolist'):
+        return box.tolist()
+    else:
+        return [0, 0, 100, 30]
+
+
+# ============ 文本相似度计算 ============
+
 def smart_chinese_similarity(text1: str, text2: str) -> float:
     """
     智能中文相似度计算：
@@ -434,9 +555,171 @@ class VideoSubtitleExtractor:
 
         return results
 
+    def _print_merge_config(self, ocr_results: Dict[str, Dict], similarity_threshold: float, gap_time_threshold: float):
+        """打印合并配置信息"""
+        print(f"\n{'='*60}")
+        print(f"智能字幕合并算法")
+        print(f"{'='*60}")
+        print(f"配置参数:")
+        print(f"  - 相似度阈值: {similarity_threshold}")
+        print(f"  - 间隙填充阈值: {gap_time_threshold}秒")
+        print(f"  - 输入帧数: {len(ocr_results)} 帧")
+
+    def _process_single_frame_for_merge(self, frame_path: str, value: Dict) -> Dict:
+        """处理单个帧数据用于合并"""
+        frame_idx = value['frame_index']
+        text = value['text'].strip() if 'text' in value else ""
+
+        # X轴中心点过滤
+        is_valid_region = True
+        if 'raw_result' in value and value['raw_result']:
+            raw_result = value['raw_result']
+            if isinstance(raw_result, list) and len(raw_result) > 0:
+                if 'dt_polys' in raw_result[0] and raw_result[0]['dt_polys']:
+                    is_valid_region = self._check_detection_regions_validity(
+                        raw_result[0]['dt_polys'], frame_path
+                    )
+
+        # 转换为简体中文
+        simplified_text = self._convert_to_simplified(text) if text else ""
+
+        # 提取置信度
+        confidence = 0.95
+        if 'items' in value and value['items']:
+            scores = [item.get('score', 0.95) for item in value['items']]
+            if scores:
+                confidence = sum(scores) / len(scores)
+
+        return {
+            'frame_index': frame_idx,
+            'frame_path': frame_path,
+            'text': simplified_text if is_valid_region else "",
+            'has_text': bool(simplified_text and is_valid_region),
+            'has_detection': 'raw_result' in value and value['raw_result'] is not None,
+            'is_valid_region': is_valid_region,
+            'raw_result': value.get('raw_result'),
+            'confidence': confidence
+        }
+
+    def _preprocess_ocr_frames(self, ocr_results: Dict[str, Dict]) -> List[Dict]:
+        """预处理OCR帧：排序、X轴过滤、简体转换"""
+        print(f"\n[步骤 1/3] X轴中心点过滤 - 剔除无效识别区域")
+
+        sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
+
+        filtered_frames = []
+        filtered_out_count = 0
+
+        for frame_path, value in sorted_results:
+            frame_data = self._process_single_frame_for_merge(frame_path, value)
+            filtered_frames.append(frame_data)
+
+            if not frame_data['is_valid_region'] and value.get('text', '').strip():
+                filtered_out_count += 1
+
+        text_frames_count = sum(1 for f in filtered_frames if f['has_text'])
+        print(f"  ✓ 过滤完成")
+        print(f"    - 剔除无效区域: {filtered_out_count} 帧")
+        print(f"    - 保留有效文本: {text_frames_count} 帧")
+
+        return filtered_frames
+
+    def _should_merge_segments(self, current_segment: Dict, frame_idx: int,
+                               text: str, similarity_threshold: float) -> bool:
+        """判断是否应该合并段落"""
+        current_end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
+        new_start_time = frame_idx / self.extract_fps + self.start_time
+        time_gap = new_start_time - current_end_time
+
+        similarity = smart_chinese_similarity(current_segment['text'], text)
+
+        is_time_continuous = abs(time_gap) < 0.001
+        is_short_gap = 0 < time_gap < 0.15
+        is_similar = similarity >= similarity_threshold
+
+        return is_similar and (is_time_continuous or is_short_gap)
+
+    def _merge_similar_segments(self, filtered_frames: List[Dict],
+                               similarity_threshold: float) -> List[Dict]:
+        """智能相似度合并"""
+        print(f"\n[步骤 2/3] 智能相似度合并")
+        print(f"  - 2-4字短文本智能识别")
+        print(f"  - 置信度优先选择")
+
+        merged_segments = []
+        current_segment = None
+        text_variants = []
+
+        for frame_data in filtered_frames:
+            if not frame_data['has_text']:
+                continue
+
+            frame_idx = frame_data['frame_index']
+            text = frame_data['text']
+            confidence = frame_data.get('confidence', 0.95)
+
+            if current_segment is None:
+                current_segment = {
+                    'start_frame': frame_idx,
+                    'end_frame': frame_idx,
+                    'text': text,
+                    'frame_indices': [frame_idx]
+                }
+                text_variants = [{'text': text, 'confidence': confidence}]
+            else:
+                should_merge = self._should_merge_segments(
+                    current_segment, frame_idx, text, similarity_threshold
+                )
+
+                if should_merge:
+                    current_segment['end_frame'] = frame_idx
+                    current_segment['frame_indices'].append(frame_idx)
+                    text_variants.append({'text': text, 'confidence': confidence})
+                else:
+                    current_segment['text'] = self._select_best_text_from_variants(text_variants)
+                    merged_segments.append(current_segment)
+
+                    current_segment = {
+                        'start_frame': frame_idx,
+                        'end_frame': frame_idx,
+                        'text': text,
+                        'frame_indices': [frame_idx]
+                    }
+                    text_variants = [{'text': text, 'confidence': confidence}]
+
+        if current_segment:
+            current_segment['text'] = self._select_best_text_from_variants(text_variants)
+            merged_segments.append(current_segment)
+
+        return merged_segments
+
+    def _print_merge_stats(self, text_frames_count: int, merged_segments: List[Dict]):
+        """打印合并统计信息"""
+        print(f"  ✓ 合并完成")
+        print(f"    - 输入文本帧: {text_frames_count} 帧")
+        print(f"    - 合并后段落: {len(merged_segments)} 个")
+        print(f"    - 压缩率: {(1 - len(merged_segments) / text_frames_count) * 100:.1f}%")
+
+    def _print_final_stats(self, ocr_results: Dict, text_frames_count: int, final_segments: List[Dict]):
+        """打印最终统计信息"""
+        print(f"\n{'='*60}")
+        print(f"✓ 智能合并完成")
+        print(f"{'='*60}")
+        print(f"统计信息:")
+        print(f"  - 原始OCR帧数: {len(ocr_results)} 帧")
+        print(f"  - 有效文本帧数: {text_frames_count} 帧")
+        print(f"  - 最终段落数量: {len(final_segments)} 个")
+        print(f"  - 整体压缩率: {(1 - len(final_segments) / len(ocr_results)) * 100:.1f}%")
+        print(f"{'='*60}\n")
+
     def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, gap_time_threshold: float = 2.0) -> List[Dict]:
         """
-        智能合并字幕段，按正确顺序执行：过滤 → 合并 → 间隙填充
+        智能合并字幕段（重构版）
+
+        重构优化：
+        - 拆分为独立的辅助方法
+        - 每个步骤职责单一
+        - 提高代码可读性和可维护性
 
         算法流程：
         1. X轴中心点过滤：剔除不在字幕区域的文本
@@ -454,161 +737,32 @@ class VideoSubtitleExtractor:
         if not ocr_results:
             return []
 
-        print(f"\n{'='*60}")
-        print(f"智能字幕合并算法")
-        print(f"{'='*60}")
-        print(f"配置参数:")
-        print(f"  - 相似度阈值: {similarity_threshold}")
-        print(f"  - 间隙填充阈值: {gap_time_threshold}秒")
-        print(f"  - 输入帧数: {len(ocr_results)} 帧")
-        print(f"\n[步骤 1/3] X轴中心点过滤 - 剔除无效识别区域")
+        # 打印配置信息
+        self._print_merge_config(ocr_results, similarity_threshold, gap_time_threshold)
 
-        # 按帧索引排序
-        sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
-
-        # 步骤1：预处理 - 转换简体中文，应用X轴中心点过滤
-        filtered_frames = []
-        filtered_out_count = 0
-
-        for frame_path, value in sorted_results:
-            frame_idx = value['frame_index']
-            text = value['text'].strip() if 'text' in value else ""
-
-            # X轴中心点过滤：检查检测区域是否有效
-            is_valid_region = True
-            if 'raw_result' in value and value['raw_result']:
-                raw_result = value['raw_result']
-                # 检查是否有检测框
-                if isinstance(raw_result, list) and len(raw_result) > 0:
-                    if 'dt_polys' in raw_result[0] and raw_result[0]['dt_polys']:
-                        is_valid_region = self._check_detection_regions_validity(raw_result[0]['dt_polys'], frame_path)
-                        if not is_valid_region and text:
-                            filtered_out_count += 1
-
-            # 转换为简体中文
-            simplified_text = ""
-            if text:
-                simplified_text = self._convert_to_simplified(text)
-
-            # 提取置信度（从items中获取平均置信度）
-            confidence = 0.95  # 默认置信度
-            if 'items' in value and value['items']:
-                # 计算所有文本项的平均置信度
-                scores = [item.get('score', 0.95) for item in value['items']]
-                if scores:
-                    confidence = sum(scores) / len(scores)
-
-            # 保留所有帧（包括无文字但有检测区的帧，用于间隙填充）
-            filtered_frames.append({
-                'frame_index': frame_idx,
-                'frame_path': frame_path,
-                'text': simplified_text if is_valid_region else "",
-                'has_text': bool(simplified_text and is_valid_region),
-                'has_detection': 'raw_result' in value and value['raw_result'] is not None,
-                'is_valid_region': is_valid_region,
-                'raw_result': value.get('raw_result'),
-                'confidence': confidence  # 添加置信度
-            })
+        # 步骤1：预处理和X轴过滤
+        filtered_frames = self._preprocess_ocr_frames(ocr_results)
 
         text_frames_count = sum(1 for f in filtered_frames if f['has_text'])
-        print(f"  ✓ 过滤完成")
-        print(f"    - 剔除无效区域: {filtered_out_count} 帧")
-        print(f"    - 保留有效文本: {text_frames_count} 帧")
-
         if text_frames_count == 0:
             print(f"\n{'='*60}")
             print(f"❌ 错误: 过滤后没有任何有效文本帧")
             print(f"{'='*60}")
             return []
 
-        # 步骤2：智能相似度合并（包括4个汉字以下的OCR识别错的的合并）
-        print(f"\n[步骤 2/3] 智能相似度合并")
-        print(f"  - 2-4字短文本智能识别")
-        print(f"  - 置信度优先选择")
-        merged_segments = []
-        current_segment = None
-        text_variants = []
+        # 步骤2：智能相似度合并
+        merged_segments = self._merge_similar_segments(filtered_frames, similarity_threshold)
+        self._print_merge_stats(text_frames_count, merged_segments)
 
-        for frame_data in filtered_frames:
-            # 只处理有文字的帧
-            if not frame_data['has_text']:
-                continue
-
-            frame_idx = frame_data['frame_index']
-            text = frame_data['text']
-
-            # 获取置信度信息（如果有的话）
-            confidence = frame_data.get('confidence', 0.95)  # 默认置信度
-
-            if current_segment is None:
-                # 开始新段
-                current_segment = {
-                    'start_frame': frame_idx,
-                    'end_frame': frame_idx,
-                    'text': text,
-                    'frame_indices': [frame_idx]
-                }
-                text_variants = [{'text': text, 'confidence': confidence}]
-            else:
-                # 计算时间戳
-                current_end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
-                new_start_time = frame_idx / self.extract_fps + self.start_time
-                time_gap = new_start_time - current_end_time
-
-                # 使用智能相似度计算（2-4个汉字特殊处理）
-                similarity = smart_chinese_similarity(current_segment['text'], text)
-
-                # 合并条件：相似度足够 且 时间连续（或短间隔）
-                is_time_continuous = abs(time_gap) < 0.001
-                is_short_gap = 0 < time_gap < 0.15
-                is_similar = similarity >= similarity_threshold
-
-                should_merge = is_similar and (is_time_continuous or is_short_gap)
-
-                if should_merge:
-                    # 延长当前段
-                    current_segment['end_frame'] = frame_idx
-                    current_segment['frame_indices'].append(frame_idx)
-                    text_variants.append({'text': text, 'confidence': confidence})
-                else:
-                    # 完成当前段
-                    current_segment['text'] = self._select_best_text_from_variants(text_variants)
-                    merged_segments.append(current_segment)
-
-                    # 开始新段
-                    current_segment = {
-                        'start_frame': frame_idx,
-                        'end_frame': frame_idx,
-                        'text': text,
-                        'frame_indices': [frame_idx]
-                    }
-                    text_variants = [{'text': text, 'confidence': confidence}]
-
-        # 保存最后一段
-        if current_segment:
-            current_segment['text'] = self._select_best_text_from_variants(text_variants)
-            merged_segments.append(current_segment)
-
-        print(f"  ✓ 合并完成")
-        print(f"    - 输入文本帧: {text_frames_count} 帧")
-        print(f"    - 合并后段落: {len(merged_segments)} 个")
-        print(f"    - 压缩率: {(1 - len(merged_segments) / text_frames_count) * 100:.1f}%")
-
-        # 步骤3：间隙填充 - 处理有识别区但OCR识别没有文字，且时间轴完全吻合的帧
+        # 步骤3：间隙填充
         print(f"\n[步骤 3/3] 间隙填充")
         print(f"  - 处理有识别区但无文字的帧")
         print(f"  - 时间轴连续性检查")
         final_segments = self._fill_segment_gaps(merged_segments, filtered_frames, gap_time_threshold)
 
-        print(f"\n{'='*60}")
-        print(f"✓ 智能合并完成")
-        print(f"{'='*60}")
-        print(f"统计信息:")
-        print(f"  - 原始OCR帧数: {len(ocr_results)} 帧")
-        print(f"  - 有效文本帧数: {text_frames_count} 帧")
-        print(f"  - 最终段落数量: {len(final_segments)} 个")
-        print(f"  - 整体压缩率: {(1 - len(final_segments) / len(ocr_results)) * 100:.1f}%")
-        print(f"{'='*60}\n")
+        # 打印最终统计
+        self._print_final_stats(ocr_results, text_frames_count, final_segments)
+
         return final_segments
 
     def _fill_segment_gaps(self, merged_segments: List[Dict], filtered_frames: List[Dict], gap_time_threshold: float) -> List[Dict]:
@@ -979,7 +1133,12 @@ class VideoSubtitleExtractor:
 
     def _ocr_image(self, img, debug_print: bool = False, apply_x_filter: bool = False, frame_path: str = None) -> Dict:
         """
-        核心的单张图片OCR识别逻辑
+        核心的单张图片OCR识别逻辑（重构版）
+
+        重构优化：
+        - 使用纯函数提取数据
+        - 拆分为多个职责单一的辅助方法
+        - 减少代码长度和复杂度
 
         Args:
             img: OpenCV图片对象 (numpy.ndarray)
@@ -989,13 +1148,8 @@ class VideoSubtitleExtractor:
 
         Returns:
             Dict: 包含识别结果的字典
-            {
-                'texts': [{'text': str, 'simplified_text': str, 'score': float, 'box': list}],
-                'combined_text': str,
-                'raw_result': OCRResult
-            }
         """
-        # 获取图片尺寸用于几何特征计算
+        # 获取图片尺寸
         img_height = img.shape[0] if img is not None and hasattr(img, 'shape') else 480
         img_width = img.shape[1] if img is not None and hasattr(img, 'shape') else 1080
 
@@ -1005,150 +1159,38 @@ class VideoSubtitleExtractor:
 
         try:
             ocr_result = self.ocr.predict(img, use_textline_orientation=True)
+            result_data = {'texts': [], 'combined_text': "", 'raw_result': ocr_result}
 
-            # 解析OCR结果
-            result_data = {
-                'texts': [],
-                'combined_text': "",
-                'raw_result': ocr_result
-            }
-
-            if ocr_result and len(ocr_result) > 0:
-                if debug_print:
-                    dt_polys_count = len(ocr_result[0]['dt_polys']) if ocr_result and 'dt_polys' in ocr_result[0] else 0
-                    rec_texts_count = len(ocr_result[0]['rec_texts']) if ocr_result and 'rec_texts' in ocr_result[0] else 0
-                    print(f"OCR识别完成，检测到 {dt_polys_count} 个文本区域，成功识别 {rec_texts_count} 个文本")
-
-                    # 显示检测失败的区域
-                    if dt_polys_count > rec_texts_count:
-                        print(f"⚠️  有 {dt_polys_count - rec_texts_count} 个检测区域识别失败")
-
-                for i, item in enumerate(ocr_result):
-                    # 尝试不同的方式获取数据
-                    rec_texts = []
-                    rec_scores = []
-                    boxes = []
-
-                    # 方法1: 字典方式
-                    if hasattr(item, 'get'):
-                        rec_texts = item.get('rec_texts', [])
-                        rec_scores = item.get('rec_scores', [])
-
-                        # 优先使用现成的 rec_boxes
-                        rec_boxes = item.get('rec_boxes')
-                        if rec_boxes is not None and hasattr(rec_boxes, 'shape'):
-                            boxes = rec_boxes.tolist()
-                        else:
-                            # 备选方案：从 dt_polys 计算边界框
-                            dt_polys = item.get('dt_polys', [])
-                            if dt_polys:
-                                for poly in dt_polys:
-                                    x_coords = [p[0] for p in poly]
-                                    y_coords = [p[1] for p in poly]
-                                    xmin = int(min(x_coords))
-                                    xmax = int(max(x_coords))
-                                    ymin = int(min(y_coords))
-                                    ymax = int(max(y_coords))
-                                    boxes.append([xmin, ymin, xmax, ymax])
-                            else:
-                                # 最后尝试获取boxes字段
-                                boxes = item.get('boxes', [])
-
-                    # 方法2: 属性方式
-                    if not rec_texts:
-                        rec_texts = getattr(item, 'rec_texts', [])
-                        rec_scores = getattr(item, 'rec_scores', [])
-                        dt_polys = getattr(item, 'dt_polys', [])
-
-                        # 如果有检测框，转换为边界框格式
-                        if dt_polys:
-                            for poly in dt_polys:
-                                x_coords = [p[0] for p in poly]
-                                y_coords = [p[1] for p in poly]
-                                xmin = int(min(x_coords))
-                                xmax = int(max(x_coords))
-                                ymin = int(min(y_coords))
-                                ymax = int(max(y_coords))
-                                boxes.append([xmin, ymin, xmax, ymax])
-                        else:
-                            boxes = getattr(item, 'boxes', [])
-
-                    # 方法3: 尝试其他可能的属性名
-                    if not rec_texts:
-                        # 尝试直接访问文本内容
-                        if hasattr(item, 'text'):
-                            rec_texts = [item.text] if item.text else []
-                            rec_scores = [getattr(item, 'score', 1.0)] if item.text else []
-                        elif hasattr(item, 'texts'):
-                            rec_texts = item.texts
-                            rec_scores = getattr(item, 'scores', [1.0] * len(rec_texts))
-
-                    # 如果boxes为空，创建默认的boxes
-                    if rec_texts and (not boxes or len(boxes) != len(rec_texts)):
-                        boxes = [[0, 0, 100, 30] for _ in rec_texts]
-
-                    if rec_texts and rec_scores:
-                        for j, (text, score, box) in enumerate(zip(rec_texts, rec_scores, boxes)):
-                            if debug_print:
-                                print(f"  检测到文本 {j+1}: \"{text}\" (置信度: {score:.3f})")
-
-                            if score > 0.5:  # 置信度阈值
-                                # 获取边界框坐标
-                                box_coords = box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
-
-                                # X轴中心点过滤（如果启用）
-                                if apply_x_filter:
-                                    # 计算文本框的中心点X坐标
-                                    center_x = (box_coords[0] + box_coords[2]) / 2
-                                    img_center_x = img_width / 2
-                                    tolerance_ratio = 0.15  # 15%的容忍度
-                                    tolerance = img_width * tolerance_ratio
-
-                                    # 检查是否在字幕中心区域
-                                    is_in_center = abs(center_x - img_center_x) <= tolerance
-
-                                    if not is_in_center:
-                                        if debug_print:
-                                            print(f"    ✗ 跳过: X轴偏离中心 (中心X={center_x:.1f}, 图片中心={img_center_x:.1f}, 容忍±{tolerance:.1f})")
-                                        continue
-
-                                # 转换为简体中文
-                                simplified_text = self._convert_to_simplified(text)
-
-                                text_info = {
-                                    'text': text,
-                                    'simplified_text': simplified_text,
-                                    'score': float(score),
-                                    'box': box_coords
-                                }
-                                result_data['texts'].append(text_info)
-
-                                if debug_print:
-                                    if apply_x_filter:
-                                        center_x = (box_coords[0] + box_coords[2]) / 2
-                                        print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f}, 中心X={center_x:.1f})")
-                                    else:
-                                        print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
-                            else:
-                                if debug_print:
-                                    print(f"    ✗ 跳过: 置信度过低 ({score:.3f} < 0.5)")
-
-                # 合并所有文本
-                if result_data['texts']:
-                    # 先合并文本，然后去除所有空白符
-                    combined_text = ''.join([item['simplified_text'] for item in result_data['texts']])
-                    # 去除所有空白符（空格、换行、制表符等）
-                    combined_text = ''.join(combined_text.split())
-                    result_data['combined_text'] = combined_text
-
-                    if debug_print:
-                        print(f"\n合并文本: \"{combined_text}\"")
-                else:
-                    if debug_print:
-                        print("\n未识别到任何文本")
-            else:
+            if not ocr_result or len(ocr_result) == 0:
                 if debug_print:
                     print("OCR识别完成，但未找到任何文本")
+                return result_data
+
+            # 打印统计信息
+            if debug_print:
+                self._print_ocr_stats(ocr_result)
+
+            # 处理每个OCR结果项
+            for i, item in enumerate(ocr_result):
+                rec_texts, rec_scores, boxes = _extract_ocr_data_from_item(item)
+
+                if rec_texts and rec_scores:
+                    self._process_ocr_texts(
+                        rec_texts, rec_scores, boxes,
+                        img_width, apply_x_filter,
+                        result_data, debug_print
+                    )
+
+            # 合并所有文本
+            if result_data['texts']:
+                combined_text = ''.join([item['simplified_text'] for item in result_data['texts']])
+                result_data['combined_text'] = ''.join(combined_text.split())
+
+                if debug_print:
+                    print(f"\n合并文本: \"{result_data['combined_text']}\"")
+            else:
+                if debug_print:
+                    print("\n未识别到任何文本")
 
             return result_data
 
@@ -1156,6 +1198,61 @@ class VideoSubtitleExtractor:
             if debug_print:
                 print(f"OCR识别失败: {e}")
             raise
+
+    def _print_ocr_stats(self, ocr_result: list):
+        """打印OCR统计信息"""
+        dt_polys_count = len(ocr_result[0]['dt_polys']) if ocr_result and 'dt_polys' in ocr_result[0] else 0
+        rec_texts_count = len(ocr_result[0]['rec_texts']) if ocr_result and 'rec_texts' in ocr_result[0] else 0
+        print(f"OCR识别完成，检测到 {dt_polys_count} 个文本区域，成功识别 {rec_texts_count} 个文本")
+
+        if dt_polys_count > rec_texts_count:
+            print(f"⚠️  有 {dt_polys_count - rec_texts_count} 个检测区域识别失败")
+
+    def _process_ocr_texts(self, rec_texts: list, rec_scores: list, boxes: list,
+                          img_width: int, apply_x_filter: bool,
+                          result_data: dict, debug_print: bool):
+        """处理OCR识别的文本列表"""
+        for j, (text, score, box) in enumerate(zip(rec_texts, rec_scores, boxes)):
+            if debug_print:
+                print(f"  检测到文本 {j+1}: \"{text}\" (置信度: {score:.3f})")
+
+            if score <= 0.5:  # 置信度阈值
+                if debug_print:
+                    print(f"    ✗ 跳过: 置信度过低 ({score:.3f} < 0.5)")
+                continue
+
+            # 规范化边界框
+            box_coords = _normalize_box_coords(box)
+
+            # X轴中心点过滤
+            if apply_x_filter:
+                is_in_center, center_x, img_center_x, tolerance = _is_text_in_center_region(
+                    box_coords, img_width
+                )
+
+                if not is_in_center:
+                    if debug_print:
+                        print(f"    ✗ 跳过: X轴偏离中心 (中心X={center_x:.1f}, "
+                              f"图片中心={img_center_x:.1f}, 容忍±{tolerance:.1f})")
+                    continue
+
+            # 转换为简体中文并保存
+            simplified_text = self._convert_to_simplified(text)
+            text_info = {
+                'text': text,
+                'simplified_text': simplified_text,
+                'score': float(score),
+                'box': box_coords
+            }
+            result_data['texts'].append(text_info)
+
+            # 打印采用信息
+            if debug_print:
+                if apply_x_filter:
+                    center_x = (box_coords[0] + box_coords[2]) / 2
+                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f}, 中心X={center_x:.1f})")
+                else:
+                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
 
 
     def _select_best_text_from_variants(self, text_variants: List) -> str:
