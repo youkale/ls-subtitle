@@ -121,7 +121,7 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.7,      # 识别阈值，平衡敏感度和噪声过滤
+            text_rec_score_thresh=0.8,      # 识别阈值，平衡敏感度和噪声过滤
             text_det_box_thresh=0.5,        # 检测阈值，适中设置
             text_det_thresh=0.1,            # 像素阈值，适中敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
@@ -513,9 +513,9 @@ class VideoSubtitleExtractor:
         """
         合并连续相同或相似的字幕段
 
-        新的合并算法，基于时间连续性：
-        1. 如果前一句的结束时间 = 当前句的开始时间，且文本相似，则合并
-        2. 移除时间间隔逻辑，改为严格的时间连续性判断
+        改进的合并算法，基于时间连续性和短间隔容忍：
+        1. 严格时间连续：前一句结束时间 = 当前句开始时间，且文本相似，则合并
+        2. 短间隔合并：time_gap < 150ms 且文本相似，则合并（处理1帧识别失败）
         3. 相似度阈值优化 - 设置为0.8以处理OCR错误
         4. 标点符号处理 - 忽略标点符号差异
 
@@ -529,7 +529,7 @@ class VideoSubtitleExtractor:
         if not ocr_results:
             return []
 
-        print(f"正在合并字幕段（相似度阈值: {similarity_threshold}，基于时间连续性）...")
+        print(f"正在合并字幕段（相似度阈值: {similarity_threshold}，时间连续性+150ms短间隔容忍）...")
 
         # 按帧索引排序
         sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
@@ -577,11 +577,17 @@ class VideoSubtitleExtractor:
                 current_normalized = self._normalize_text(current_segment['text'])
                 similarity = text_similarity(normalized_text, current_normalized)
 
-                # 判断是否应该合并：前一句结束时间 = 当前句开始时间 且 文本相似
-                is_time_continuous = abs(current_end_time - new_start_time) < 0.001  # 允许1毫秒的浮点误差
+                # 计算时间间隔
+                time_gap = new_start_time - current_end_time
+
+                # 判断是否应该合并的条件：
+                # 1. 严格时间连续：前一句结束时间 = 当前句开始时间 且 文本相似
+                # 2. 短时间间隔：time_gap < 150ms 且 文本相似（处理1帧识别失败的情况）
+                is_time_continuous = abs(time_gap) < 0.001  # 允许1毫秒的浮点误差
+                is_short_gap = 0 < time_gap < 0.15  # 150毫秒内的短间隔
                 is_similar = similarity >= similarity_threshold
 
-                should_merge = is_time_continuous and is_similar
+                should_merge = is_similar and (is_time_continuous or is_short_gap)
 
                 if should_merge:
                     # 延长当前段
@@ -876,31 +882,14 @@ class VideoSubtitleExtractor:
                 if debug_print:
                     print(f"      X轴中心检测: 中心点={img_center_x:.1f}未穿过文本范围[{text_left_edge:.1f}, {text_right_edge:.1f}]")
 
-        # 基于分析结果的过滤规则（针对PP-OCRv5优化）
-        is_wide_text = aspect_ratio > 1.6  # 宽高比大于1.6（字幕通常更宽扁）
-        is_reasonable_height = relative_height < 0.5  # 相对高度小于50%（放宽阈值适应v5）
-        is_reasonable_char_width = avg_char_width < 120  # 平均字符宽度小于120px（放宽阈值适应v5）
-
-        # 车牌检测已移除
-
-        # 单汉字特殊逻辑已移除，所有文本使用统一过滤规则
-
-        # 综合判断 - 以X轴中心点检测为主要条件
-        if passes_center_axis:
-            # 通过X轴中心点检测后，所有文本使用统一的几何特征检查
-            passes_geometry = is_reasonable_height and is_reasonable_char_width
-        else:
-            # 如果未通过X轴中心点检测，直接过滤
-            passes_geometry = False
-
-        # 移除车牌检测，仅依赖几何特征
-        result = passes_geometry
+        # 简化过滤逻辑：只使用X轴中心点检测，去除几何验证
+        result = passes_center_axis
 
         if debug_print:
             print(f"      几何分析: 宽高比={aspect_ratio:.2f}, 相对高度={relative_height:.3f}, 字符宽度={avg_char_width:.1f}")
             print(f"      中心轴检测: {'通过' if passes_center_axis else '未通过'}")
             if passes_center_axis:
-                print(f"      几何特征检查: 高度合理={is_reasonable_height}, 字符合理={is_reasonable_char_width}")
+                print(f"      通过X轴中心点检测，接受文本")
             else:
                 print(f"      过滤原因: 未通过X轴中心点检测")
             print(f"      最终结果: {'通过' if result else '过滤'}")
