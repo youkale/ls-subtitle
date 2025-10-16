@@ -818,83 +818,6 @@ class VideoSubtitleExtractor:
 
         return str(output_path)
 
-    def _is_likely_subtitle_by_geometry(self, box_coords: list, text: str, img_height: int, img_width: int = None, debug_print: bool = False) -> bool:
-        """
-        基于几何特征判断文本是否可能是字幕
-
-        Args:
-            box_coords: 文本边界框坐标 [x1, y1, x2, y2]
-            text: 文本内容
-            img_height: 图片高度（用于计算相对高度）
-            img_width: 图片宽度（用于X轴中心点检测）
-            debug_print: 是否打印调试信息
-
-        Returns:
-            bool: True表示可能是字幕，False表示可能是噪声
-        """
-        if len(box_coords) < 4:
-            return True  # 如果坐标不完整，默认通过
-
-        x1, y1, x2, y2 = box_coords[:4]
-        width = x2 - x1
-        height = y2 - y1
-        char_count = len(text)
-
-        if width <= 0 or height <= 0 or char_count == 0:
-            return True  # 避免除零错误，默认通过
-
-        # 计算几何特征
-        aspect_ratio = width / height
-        avg_char_width = width / char_count
-        relative_height = height / img_height  # 使用实际图片高度计算相对高度
-
-        # X轴中心点穿过检测（新的主要过滤逻辑）
-        passes_center_axis = True
-        if img_width is not None:
-            img_center_x = img_width / 2
-            text_left_edge = x1
-            text_right_edge = x2
-
-            # 检查图片X轴中心点是否穿过文本区域
-            center_passes_through = text_left_edge <= img_center_x <= text_right_edge
-
-            if center_passes_through:
-                # 计算左右两边的宽度
-                left_width = img_center_x - text_left_edge
-                right_width = text_right_edge - img_center_x
-                total_text_width = text_right_edge - text_left_edge
-
-                # 计算左右宽度的相对比例
-                left_ratio = left_width / total_text_width if total_text_width > 0 else 0
-                right_ratio = right_width / total_text_width if total_text_width > 0 else 0
-
-                # 检查左右宽度是否在合理范围内（15%的容差）
-                min_ratio = 0.15  # 最小15%
-                max_ratio = 0.85  # 最大85%
-
-                passes_center_axis = (min_ratio <= left_ratio <= max_ratio) and (min_ratio <= right_ratio <= max_ratio)
-
-                if debug_print:
-                    print(f"      X轴中心检测: 中心点={img_center_x:.1f}, 文本范围=[{text_left_edge:.1f}, {text_right_edge:.1f}]")
-                    print(f"      左右比例: 左={left_ratio:.1%}, 右={right_ratio:.1%}, 通过={passes_center_axis}")
-            else:
-                passes_center_axis = False
-                if debug_print:
-                    print(f"      X轴中心检测: 中心点={img_center_x:.1f}未穿过文本范围[{text_left_edge:.1f}, {text_right_edge:.1f}]")
-
-        # 简化过滤逻辑：只使用X轴中心点检测，去除几何验证
-        result = passes_center_axis
-
-        if debug_print:
-            print(f"      几何分析: 宽高比={aspect_ratio:.2f}, 相对高度={relative_height:.3f}, 字符宽度={avg_char_width:.1f}")
-            print(f"      中心轴检测: {'通过' if passes_center_axis else '未通过'}")
-            if passes_center_axis:
-                print(f"      通过X轴中心点检测，接受文本")
-            else:
-                print(f"      过滤原因: 未通过X轴中心点检测")
-            print(f"      最终结果: {'通过' if result else '过滤'}")
-
-        return result
 
 
 
@@ -1012,24 +935,22 @@ class VideoSubtitleExtractor:
                                 print(f"  检测到文本 {j+1}: \"{text}\" (置信度: {score:.3f})")
 
                             if score > 0.5:  # 置信度阈值
-                                # 几何特征过滤
+                                # 转换为简体中文
+                                simplified_text = self._convert_to_simplified(text)
+
+                                # 获取边界框坐标
                                 box_coords = box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
-                                if self._is_likely_subtitle_by_geometry(box_coords, text, img_height, img_width, debug_print):
-                                    # 转换为简体中文
-                                    simplified_text = self._convert_to_simplified(text)
 
-                                    text_info = {
-                                        'text': text,
-                                        'simplified_text': simplified_text,
-                                        'score': float(score),
-                                        'box': box_coords
-                                    }
-                                    result_data['texts'].append(text_info)
+                                text_info = {
+                                    'text': text,
+                                    'simplified_text': simplified_text,
+                                    'score': float(score),
+                                    'box': box_coords
+                                }
+                                result_data['texts'].append(text_info)
 
-                                    if debug_print:
-                                        print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
-                                elif debug_print:
-                                    print(f"    ❌ 几何过滤: \"{text}\" (置信度: {score:.3f})")
+                                if debug_print:
+                                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
                             else:
                                 if debug_print:
                                     print(f"    ✗ 跳过: 置信度过低 ({score:.3f} < 0.5)")
