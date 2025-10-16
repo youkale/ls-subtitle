@@ -192,6 +192,7 @@ def _normalize_box_coords(box) -> list:
 def smart_chinese_similarity(text1: str, text2: str) -> float:
     """
     智能中文相似度计算：
+    - 去除所有标点符号后进行比较
     - 对于2-4个汉字，只要有(长度-1)个字符正确就认为匹配成功
     - 其他情况使用标准相似度计算
 
@@ -205,25 +206,45 @@ def smart_chinese_similarity(text1: str, text2: str) -> float:
     if not text1 or not text2:
         return 0.0
 
-    # 去除空格和标点，只保留中文字符
+    # 去除所有标点符号和空格，只保留中文字符、英文字母和数字
     import re
-    clean1 = re.sub(r'[^\u4e00-\u9fff]', '', text1)
-    clean2 = re.sub(r'[^\u4e00-\u9fff]', '', text2)
+    import string
+    # 中文标点符号
+    chinese_punctuation = '，。！？；：""''（）【】《》、·—…'
+    # 所有要去除的标点
+    all_punctuation = string.punctuation + chinese_punctuation + ' \t\n\r'
+
+    # 创建翻译表
+    translator = str.maketrans('', '', all_punctuation)
+    clean1 = text1.translate(translator)
+    clean2 = text2.translate(translator)
 
     if not clean1 or not clean2:
-        return text_similarity(text1, text2)
+        return 0.0
+
+    # 如果去除标点后完全相同，直接返回1.0
+    if clean1 == clean2:
+        return 1.0
+
+    # 只保留中文字符用于后续计算
+    chinese_only1 = re.sub(r'[^\u4e00-\u9fff]', '', clean1)
+    chinese_only2 = re.sub(r'[^\u4e00-\u9fff]', '', clean2)
+
+    # 如果只有中文的部分完全相同，也返回1.0
+    if chinese_only1 and chinese_only2 and chinese_only1 == chinese_only2:
+        return 1.0
 
     # 对于2-4个汉字的特殊处理
-    if 2 <= len(clean1) <= 4 and 2 <= len(clean2) <= 4:
+    if 2 <= len(chinese_only1) <= 4 and 2 <= len(chinese_only2) <= 4:
         # 如果长度相同，计算匹配字符数
-        if len(clean1) == len(clean2):
-            matches = sum(1 for c1, c2 in zip(clean1, clean2) if c1 == c2)
-            required_matches = len(clean1) - 1  # 需要(长度-1)个字符匹配
+        if len(chinese_only1) == len(chinese_only2):
+            matches = sum(1 for c1, c2 in zip(chinese_only1, chinese_only2) if c1 == c2)
+            required_matches = len(chinese_only1) - 1  # 需要(长度-1)个字符匹配
 
             if matches >= required_matches:
                 return 1.0  # 认为完全匹配
             else:
-                return matches / len(clean1)  # 返回实际匹配比例
+                return matches / len(chinese_only1)  # 返回实际匹配比例
 
         # 长度不同时，使用编辑距离的思想
         else:
@@ -241,17 +262,17 @@ def smart_chinese_similarity(text1: str, text2: str) -> float:
 
                 return dp[m][n]
 
-            lcs_len = lcs_length(clean1, clean2)
-            min_len = min(len(clean1), len(clean2))
+            lcs_len = lcs_length(chinese_only1, chinese_only2)
+            min_len = min(len(chinese_only1), len(chinese_only2))
 
             # 如果公共字符数 >= min_len - 1，认为匹配
             if lcs_len >= min_len - 1:
                 return 1.0
             else:
-                return lcs_len / max(len(clean1), len(clean2))
+                return lcs_len / max(len(chinese_only1), len(chinese_only2))
 
-    # 其他情况使用标准相似度
-    return text_similarity(text1, text2)
+    # 其他情况：比较去除标点后的文本相似度
+    return text_similarity(clean1, clean2)
 
 
 class VideoSubtitleExtractor:
