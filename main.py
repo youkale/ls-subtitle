@@ -833,15 +833,99 @@ class VideoSubtitleExtractor:
         self._print_merge_stats(text_frames_count, merged_segments)
 
         # 步骤3：间隙填充
-        print(f"\n[步骤 3/3] 间隙填充")
+        print(f"\n[步骤 3/4] 间隙填充")
         print(f"  - 处理有识别区但无文字的帧")
         print(f"  - 时间轴连续性检查")
-        final_segments = self._fill_segment_gaps(merged_segments, filtered_frames, gap_time_threshold)
+        gap_filled_segments = self._fill_segment_gaps(merged_segments, filtered_frames, gap_time_threshold)
+
+        # 步骤4：后处理合并 - 合并间隙填充后相邻且相似的段落
+        print(f"\n[步骤 4/4] 后处理合并")
+        print(f"  - 合并相似且时间连续的段落")
+        print(f"  - 去除标点符号差异")
+        final_segments = self._post_process_merge_segments(gap_filled_segments, similarity_threshold)
 
         # 打印最终统计
         self._print_final_stats(ocr_results, text_frames_count, final_segments)
 
         return final_segments
+
+    def _post_process_merge_segments(self, segments: List[Dict], similarity_threshold: float) -> List[Dict]:
+        """
+        后处理合并：合并间隙填充后相邻且相似的段落
+
+        在间隙填充后，某些原本不相邻的段落可能变得时间连续，
+        这时需要检查它们是否应该合并。
+
+        合并条件：
+        1. 段落时间连续或几乎连续（间隙 < 0.15秒）
+        2. 文本相似（去除标点后）
+
+        Args:
+            segments: 间隙填充后的段落列表
+            similarity_threshold: 相似度阈值
+
+        Returns:
+            后处理合并后的段落列表
+        """
+        if not segments or len(segments) <= 1:
+            print(f"  ✓ 无需后处理（段落数 <= 1）")
+            return segments
+
+        merged = []
+        i = 0
+        merge_count = 0
+
+        while i < len(segments):
+            current = segments[i].copy()
+
+            # 尝试与后续段落合并
+            while i + 1 < len(segments):
+                next_seg = segments[i + 1]
+
+                # 计算时间间隙（使用段落的实际时间）
+                current_end_time = current.get('end_time', (current['end_frame'] + 1) / self.extract_fps + self.start_time)
+                next_start_time = next_seg.get('start_time', next_seg['start_frame'] / self.extract_fps + self.start_time)
+                time_gap = next_start_time - current_end_time
+
+                # 计算相似度
+                similarity = smart_chinese_similarity(current['text'], next_seg['text'])
+
+                # 判断是否应该合并
+                # 时间必须连续或非常接近，且文本相似
+                is_time_continuous = abs(time_gap) < 0.15
+                is_similar = similarity >= similarity_threshold
+                should_merge = is_time_continuous and is_similar
+
+                if should_merge:
+                    # 合并：扩展当前段落的结束帧和时间
+                    current['end_frame'] = next_seg['end_frame']
+                    current['end_time'] = next_seg.get('end_time', (next_seg['end_frame'] + 1) / self.extract_fps + self.start_time)
+
+                    # 合并帧索引列表
+                    if 'frame_indices' in current and 'frame_indices' in next_seg:
+                        current['frame_indices'].extend(next_seg['frame_indices'])
+
+                    # 选择更完整的文本（带标点且长度更长的优先）
+                    if len(next_seg['text']) > len(current['text']):
+                        current['text'] = next_seg['text']
+
+                    merge_count += 1
+                    i += 1  # 跳过已合并的段落
+                else:
+                    break  # 不能合并，停止
+
+            merged.append(current)
+            i += 1
+
+        if merge_count > 0:
+            print(f"  ✓ 后处理完成")
+            print(f"    - 合并段落对数: {merge_count}")
+            print(f"    - 合并前: {len(segments)} 个段落")
+            print(f"    - 合并后: {len(merged)} 个段落")
+        else:
+            print(f"  ✓ 无需后处理合并（无相邻相似段落）")
+
+        return merged
 
     def _fill_segment_gaps(self, merged_segments: List[Dict], filtered_frames: List[Dict], gap_time_threshold: float) -> List[Dict]:
         """
