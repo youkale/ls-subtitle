@@ -584,7 +584,7 @@ class VideoSubtitleExtractor:
                 # 1. 严格时间连续：前一句结束时间 = 当前句开始时间 且 文本相似
                 # 2. 短时间间隔：time_gap < 150ms 且 文本相似（处理1帧识别失败的情况）
                 is_time_continuous = abs(time_gap) < 0.001  # 允许1毫秒的浮点误差
-                is_short_gap = 0 < time_gap < 0.15  # 150毫秒内的短间隔
+                is_short_gap = 0 < time_gap < 0.3  # 150毫秒内的短间隔
                 is_similar = similarity >= similarity_threshold
 
                 should_merge = is_similar and (is_time_continuous or is_short_gap)
