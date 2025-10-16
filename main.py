@@ -523,7 +523,7 @@ class VideoSubtitleExtractor:
 
         return final_result
 
-    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, max_gap_seconds: float = 0.2) -> List[Dict]:
+    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, max_gap_seconds: float = 0.01) -> List[Dict]:
         """
         合并连续相同或相似的字幕段
 
