@@ -335,30 +335,16 @@ class VideoSubtitleExtractor:
                 continue
 
             # 使用抽象的核心OCR识别方法
-            debug_print = (idx == 0) or (frame_path.name == "frame_000708.jpg")  # 第一帧或特定帧打印调试信息
+            debug_print = (idx == 0)  # 第一帧打印调试信息
             if debug_print:
                 tqdm.write(f"批量识别调试: 处理帧 {frame_path.name}")
 
             try:
-                # 特殊调试：为frame_000708保存调试图片
-                if frame_path.name == "frame_000708.jpg":
-                    debug_img_path = f"debug_{frame_path.name}"
-                    cv2.imwrite(debug_img_path, img)
-                    tqdm.write(f"🔍 保存调试图片: {debug_img_path}, 尺寸: {img.shape}")
-
                 ocr_result = self._ocr_image(img, debug_print=debug_print)
 
                 # 从文件名提取真实的帧索引
                 frame_name = frame_path.stem  # frame_000708
                 real_frame_index = int(frame_name.split('_')[1])  # 708
-
-                # 特殊调试：详细输出frame_000708的OCR结果
-                if frame_path.name == "frame_000708.jpg":
-                    tqdm.write(f"🔍 frame_000708 OCR原始结果:")
-                    tqdm.write(f"  - 识别到的文本数量: {len(ocr_result['texts'])}")
-                    for i, text_info in enumerate(ocr_result['texts']):
-                        tqdm.write(f"  - 文本{i+1}: \"{text_info['text']}\" -> \"{text_info['simplified_text']}\" (置信度: {text_info['score']:.3f})")
-                    tqdm.write(f"  - 合并后文本: \"{ocr_result['combined_text']}\"")
 
                 # 如果有识别结果，保存到字典中
                 if ocr_result['texts']:
@@ -523,20 +509,19 @@ class VideoSubtitleExtractor:
 
         return final_result
 
-    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, max_gap_seconds: float = 0.01) -> List[Dict]:
+    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8) -> List[Dict]:
         """
         合并连续相同或相似的字幕段
 
-        改进的合并算法，解决以下问题：
-        1. 空文本强制分割问题 - 使用时间间隔判断
-        2. 相似度阈值优化 - 降低到0.75以处理更多OCR错误
-        3. 时间间隔合并 - 短时间内的相同文本会被合并
+        新的合并算法，基于时间连续性：
+        1. 如果前一句的结束时间 = 当前句的开始时间，且文本相似，则合并
+        2. 移除时间间隔逻辑，改为严格的时间连续性判断
+        3. 相似度阈值优化 - 设置为0.8以处理OCR错误
         4. 标点符号处理 - 忽略标点符号差异
 
         Args:
             ocr_results: OCR识别结果字典
-            similarity_threshold: 文本相似度阈值（0.0-1.0），默认0.75
-            max_gap_seconds: 最大时间间隔（秒），默认0.5秒
+            similarity_threshold: 文本相似度阈值（0.0-1.0），默认0.8
 
         Returns:
             合并后的字幕段列表
@@ -544,59 +529,35 @@ class VideoSubtitleExtractor:
         if not ocr_results:
             return []
 
-        print(f"正在合并字幕段（相似度阈值: {similarity_threshold}, 最大间隔: {max_gap_seconds}秒）...")
+        print(f"正在合并字幕段（相似度阈值: {similarity_threshold}，基于时间连续性）...")
 
         # 按帧索引排序
         sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
 
-        # 第一步：创建初始段落（包含空文本段）
+        # 创建初始段落（跳过空文本）
         initial_segments = []
         for frame_path, value in sorted_results:
             text = value['text'].strip()
             frame_idx = value['frame_index']
 
-            initial_segments.append({
-                'frame_index': frame_idx,
-                'text': text,
-                'is_empty': not text
-            })
+            # 只处理非空文本
+            if text:
+                initial_segments.append({
+                    'frame_index': frame_idx,
+                    'text': text
+                })
 
-        # 第二步：智能合并算法
+        if not initial_segments:
+            return []
+
+        # 合并算法
         segments = []
         current_segment = None
         text_variants = []
 
-        for i, seg in enumerate(initial_segments):
+        for seg in initial_segments:
             text = seg['text']
             frame_idx = seg['frame_index']
-            is_empty = seg['is_empty']
-
-            # 如果是空文本，检查是否应该跳过（基于时间间隔）
-            if is_empty:
-                if current_segment is not None:
-                    # 计算时间间隔
-                    time_gap = (frame_idx - current_segment['end_frame']) / self.extract_fps
-
-                    # 如果时间间隔很小，跳过这个空文本
-                    if time_gap <= max_gap_seconds:
-                        # 查看下一个非空文本是否与当前段相似
-                        next_text = self._find_next_non_empty_text(initial_segments, i)
-                        if next_text and current_segment:
-                            current_text = self._normalize_text(current_segment['text'])
-                            next_normalized = self._normalize_text(next_text)
-                            similarity = text_similarity(current_text, next_normalized)
-
-                            if similarity >= similarity_threshold:
-                                # 跳过这个空文本，继续当前段
-                                continue
-
-                    # 否则结束当前段
-                    self._finalize_current_segment(current_segment, text_variants, segments)
-                    current_segment = None
-                    text_variants = []
-                continue
-
-            # 处理非空文本
             normalized_text = self._normalize_text(text)
 
             if current_segment is None:
@@ -608,15 +569,19 @@ class VideoSubtitleExtractor:
                 }
                 text_variants = [text]
             else:
+                # 计算时间戳
+                current_end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
+                new_start_time = frame_idx / self.extract_fps + self.start_time
+
                 # 计算与当前段的相似度
                 current_normalized = self._normalize_text(current_segment['text'])
                 similarity = text_similarity(normalized_text, current_normalized)
 
-                # 计算时间间隔
-                time_gap = (frame_idx - current_segment['end_frame']) / self.extract_fps
+                # 判断是否应该合并：前一句结束时间 = 当前句开始时间 且 文本相似
+                is_time_continuous = abs(current_end_time - new_start_time) < 0.001  # 允许1毫秒的浮点误差
+                is_similar = similarity >= similarity_threshold
 
-                # 判断是否应该合并
-                should_merge = (similarity >= similarity_threshold) and (time_gap <= max_gap_seconds)
+                should_merge = is_time_continuous and is_similar
 
                 if should_merge:
                     # 延长当前段
@@ -1104,12 +1069,6 @@ class VideoSubtitleExtractor:
                 print(f"OCR识别失败: {e}")
             raise
 
-    def _find_next_non_empty_text(self, segments: List[Dict], start_index: int) -> str:
-        """查找下一个非空文本"""
-        for i in range(start_index + 1, len(segments)):
-            if not segments[i]['is_empty']:
-                return segments[i]['text']
-        return ""
 
     def _is_likely_same_text(self, text1: str, text2: str) -> bool:
         """判断两个文本是否可能是同一句话（考虑OCR常见错误）"""
