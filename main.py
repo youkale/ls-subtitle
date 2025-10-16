@@ -697,7 +697,10 @@ class VideoSubtitleExtractor:
         print(f"  ✓ 间隙填充完成")
         if gap_filled_count > 0:
             print(f"    - 填充帧数: {gap_filled_count} 帧")
-            print(f"    - 扩展段落: {sum(1 for s in extended_segments if s['end_frame'] > merged_segments[i]['end_frame'] for i, s in enumerate(extended_segments) if i < len(merged_segments))} 个")
+            extended_count = sum(1 for i in range(len(extended_segments))
+                               if i < len(merged_segments) and
+                               extended_segments[i]['end_frame'] > merged_segments[i]['end_frame'])
+            print(f"    - 扩展段落: {extended_count} 个")
         else:
             print(f"    - 无需填充")
 
