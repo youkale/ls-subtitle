@@ -121,9 +121,9 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.8,      # 识别阈值，平衡敏感度和噪声过滤
+            text_rec_score_thresh=0.7,      # 识别阈值，平衡敏感度和噪声过滤
             text_det_box_thresh=0.5,        # 检测阈值，适中设置
-            text_det_thresh=0.6,            # 像素阈值，适中敏感度
+            text_det_thresh=0.1,            # 像素阈值，适中敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
@@ -315,131 +315,6 @@ class VideoSubtitleExtractor:
 
         return (0, subtitle_y, width, subtitle_height)
 
-    def preview_subtitle_region(self, video_path: str, frame_times: list = None):
-        """
-        预览字幕区域，生成多个时间点的标注图片
-
-        Args:
-            video_path: 视频文件路径
-            frame_times: 要预览的时间点列表（秒），如果为None则自动选择多个时间点
-        """
-        print(f"生成字幕区域预览...")
-
-        # 获取视频时长
-        try:
-            duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                          '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
-            result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True)
-            duration = float(result.stdout.strip())
-            print(f"视频时长: {duration:.1f}秒")
-        except:
-            print("警告: 无法获取视频时长，使用默认时间点")
-            duration = 60
-
-        # 如果没有指定时间点，自动选择多个时间点
-        if frame_times is None:
-            # 选择开头、1/4、1/2、3/4、结尾前的时间点
-            frame_times = [
-                10,  # 开头10秒
-                duration * 0.25,  # 1/4处
-                duration * 0.5,   # 中间
-                duration * 0.75,  # 3/4处
-                max(10, duration - 10)  # 结尾前10秒
-            ]
-            # 去重并排序
-            frame_times = sorted(list(set([t for t in frame_times if 0 < t < duration])))
-
-        print(f"将预览 {len(frame_times)} 个时间点:")
-        for i, t in enumerate(frame_times, 1):
-            print(f"  {i}. {t:.1f}秒")
-        print()
-
-        preview_files = []
-        crop_files = []
-
-        for idx, time_sec in enumerate(frame_times):
-            # 提取指定时间点的帧
-            temp_frame = self.frames_dir / f"preview_frame_{idx}.jpg"
-            cmd = [
-                'ffmpeg',
-                '-ss', str(time_sec),
-                '-i', video_path,
-                '-frames:v', '1',
-                str(temp_frame),
-                '-y'
-            ]
-
-            try:
-                subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-                # 读取图片
-                img = cv2.imread(str(temp_frame))
-                if img is None:
-                    print(f"⚠ 无法读取第{idx+1}个预览帧 (时间: {time_sec:.1f}s)")
-                    continue
-
-                height, width = img.shape[:2]
-
-                # 计算字幕区域
-                bottom_y = int(height * (1 - self.subtitle_region_top))
-                top_y = int(height * (1 - self.subtitle_region_bottom))
-
-                # 创建标注图片
-                preview_img = img.copy()
-
-                # 绘制字幕区域矩形（绿色）
-                cv2.rectangle(preview_img, (0, bottom_y), (width, top_y), (0, 255, 0), 3)
-
-                # 添加文字标注
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                cv2.putText(preview_img, f'Subtitle Region (Time: {time_sec:.1f}s)',
-                           (10, bottom_y - 10), font, 1, (0, 255, 0), 2)
-                cv2.putText(preview_img, f'Bottom: {self.subtitle_region_bottom*100:.0f}%',
-                           (10, top_y + 30), font, 0.8, (0, 255, 0), 2)
-                cv2.putText(preview_img, f'Top: {self.subtitle_region_top*100:.0f}%',
-                           (10, bottom_y - 40), font, 0.8, (0, 255, 0), 2)
-
-                # 裁剪字幕区域
-                subtitle_crop = img[bottom_y:top_y, :]
-
-                # 保存完整预览图
-                preview_path = self.output_dir / f"preview_region_{idx+1}_{int(time_sec)}s.jpg"
-                cv2.imwrite(str(preview_path), preview_img)
-                preview_files.append(preview_path)
-
-                # 保存裁剪后的字幕区域
-                crop_path = self.output_dir / f"preview_crop_{idx+1}_{int(time_sec)}s.jpg"
-                cv2.imwrite(str(crop_path), subtitle_crop)
-                crop_files.append(crop_path)
-
-                print(f"✓ 第{idx+1}个预览 (时间: {time_sec:.1f}s) 已生成")
-
-            except subprocess.CalledProcessError as e:
-                print(f"✗ 提取第{idx+1}个预览帧失败 (时间: {time_sec:.1f}s): {e.stderr}")
-
-        # 打印总结
-        print(f"\n{'='*60}")
-        print(f"预览生成完成！共 {len(preview_files)} 个时间点")
-        print(f"{'='*60}")
-        print(f"\n完整标注图片 ({len(preview_files)}张):")
-        for f in preview_files:
-            print(f"  - {f}")
-
-        print(f"\n字幕裁剪图片 ({len(crop_files)}张):")
-        for f in crop_files:
-            print(f"  - {f}")
-
-        if preview_files:
-            # 使用第一张图获取尺寸信息
-            img = cv2.imread(str(preview_files[0]))
-            height, width = img.shape[:2]
-            bottom_y = int(height * (1 - self.subtitle_region_top))
-            top_y = int(height * (1 - self.subtitle_region_bottom))
-
-            print(f"\n字幕区域信息：")
-            print(f"  视频尺寸: {width}x{height}")
-            print(f"  字幕区域: y={bottom_y} 到 y={top_y} (高度={top_y-bottom_y}px)")
-            print(f"  占比: 底部{self.subtitle_region_bottom*100:.0f}% 到 {self.subtitle_region_top*100:.0f}%")
 
     def ocr_frames(self) -> Dict[str, Dict]:
         """
@@ -777,13 +652,202 @@ class VideoSubtitleExtractor:
         normalized = re.sub(r'[^\w\u4e00-\u9fff]', '', text)
         return normalized.lower()
 
+    def _serialize_ocr_result(self, ocr_result) -> dict:
+        """
+        将PaddleOCR的原始结果转换为可序列化的格式
+
+        Args:
+            ocr_result: PaddleOCR的原始结果
+
+        Returns:
+            可序列化的字典格式结果
+        """
+        if not ocr_result or len(ocr_result) == 0:
+            return {
+                'status': 'no_result',
+                'message': '未检测到任何文本'
+            }
+
+        try:
+            # 处理OCR结果（可能是list格式）
+            if isinstance(ocr_result, list) and len(ocr_result) > 0:
+                item = ocr_result[0]
+
+                serialized_result = {
+                    'status': 'success',
+                    'detection_count': len(item.get('dt_polys', [])) if 'dt_polys' in item else 0,
+                    'recognition_count': len(item.get('rec_texts', [])) if 'rec_texts' in item else 0,
+                    'dt_polys': [],
+                    'rec_texts': item.get('rec_texts', []),
+                    'rec_scores': item.get('rec_scores', []),
+                    'rec_boxes': [],
+                    'textline_orientation_angles': item.get('textline_orientation_angles', [])
+                }
+
+                # 转换检测框坐标
+                if 'dt_polys' in item and item['dt_polys']:
+                    for poly in item['dt_polys']:
+                        if hasattr(poly, 'tolist'):
+                            serialized_result['dt_polys'].append(poly.tolist())
+                        else:
+                            serialized_result['dt_polys'].append(poly)
+
+                # 转换识别框坐标
+                if 'rec_boxes' in item and item['rec_boxes'] is not None:
+                    if hasattr(item['rec_boxes'], 'tolist'):
+                        serialized_result['rec_boxes'] = item['rec_boxes'].tolist()
+                    else:
+                        serialized_result['rec_boxes'] = item['rec_boxes']
+
+                # 转换分数为普通float
+                if 'rec_scores' in item and item['rec_scores']:
+                    serialized_result['rec_scores'] = [float(score) for score in item['rec_scores']]
+
+                return serialized_result
+            else:
+                return {
+                    'status': 'unknown_format',
+                    'message': '未知的OCR结果格式',
+                    'raw_type': str(type(ocr_result))
+                }
+
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'序列化OCR结果时出错: {str(e)}',
+                'error_type': type(e).__name__
+            }
+
     def _convert_to_simplified(self, text: str) -> str:
         """将文本转换为简体中文"""
         if self.cc and text:
             return self.cc.convert(text)
         return text
 
-    def _is_likely_subtitle_by_geometry(self, box_coords: list, text: str, img_height: int, debug_print: bool = False) -> bool:
+    def visualize_ocr_result(self, json_file_path: str) -> str:
+        """
+        根据OCR结果JSON文件在原图上绘制检测和识别区域
+
+        Args:
+            json_file_path: OCR结果JSON文件路径
+
+        Returns:
+            可视化结果图片的保存路径
+        """
+        import json
+        import cv2
+        import numpy as np
+        from pathlib import Path
+
+        json_path = Path(json_file_path)
+        if not json_path.exists():
+            raise FileNotFoundError(f"JSON文件不存在: {json_path}")
+
+        # 读取JSON文件
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except UnicodeDecodeError as e:
+            raise ValueError(f"JSON文件编码错误: {e}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON文件格式错误: {e}")
+
+        # 检查JSON文件格式
+        if 'paddleocr_raw_result' not in data:
+            raise ValueError(
+                f"JSON文件格式不正确：缺少 'paddleocr_raw_result' 字段。\n"
+                f"请使用 --save-result 参数生成的原始OCR结果文件。\n"
+                f"当前文件包含的字段: {list(data.keys())}"
+            )
+
+        # 获取原图路径
+        image_path = Path(data['image_path'])
+        if not image_path.exists():
+            raise FileNotFoundError(f"原图文件不存在: {image_path}")
+
+        # 读取原图
+        try:
+            img = cv2.imread(str(image_path))
+            if img is None:
+                raise ValueError(f"OpenCV无法读取图片: {image_path}")
+        except Exception as e:
+            raise ValueError(f"读取图片时出错: {e}")
+
+        # 创建副本用于绘制
+        vis_img = img.copy()
+
+        ocr_result = data.get('paddleocr_raw_result', {})
+        if ocr_result.get('status') != 'success':
+            print(f"OCR结果状态异常: {ocr_result.get('status', 'unknown')}")
+            return str(image_path)
+
+        # 绘制检测区域 (dt_polys) - 蓝色
+        dt_polys = ocr_result.get('dt_polys', [])
+        img_height = vis_img.shape[0]
+
+        for i, poly in enumerate(dt_polys):
+            if len(poly) >= 4:
+                # 使用原始坐标（左上角原点）
+                points = np.array(poly, dtype=np.int32)
+                # 绘制多边形
+                cv2.polylines(vis_img, [points], True, (255, 0, 0), 2)  # 蓝色
+                # 添加标签
+                cv2.putText(vis_img, f'D{i+1}', tuple(points[0]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+        # 绘制识别区域 (rec_boxes) - 绿色，并添加识别文本
+        rec_boxes = ocr_result.get('rec_boxes', [])
+        rec_texts = ocr_result.get('rec_texts', [])
+        rec_scores = ocr_result.get('rec_scores', [])
+
+        for i, box in enumerate(rec_boxes):
+            if len(box) >= 4:
+                x1, y1, x2, y2 = box[:4]
+                # 绘制矩形
+                cv2.rectangle(vis_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)  # 绿色
+
+                # 添加识别文本和置信度
+                if i < len(rec_texts):
+                    text = rec_texts[i]
+                    score = rec_scores[i] if i < len(rec_scores) else 0.0
+                    label = f'R{i+1}: {text} ({score:.3f})'
+
+                    # 计算文本位置（在矩形上方）
+                    text_y = max(int(y1) - 10, 20)
+
+                    # 绘制文本背景
+                    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                    cv2.rectangle(vis_img, (int(x1), text_y - text_size[1] - 5),
+                                 (int(x1) + text_size[0] + 5, text_y + 5), (0, 255, 0), -1)
+
+                    # 绘制文本
+                    cv2.putText(vis_img, label, (int(x1) + 2, text_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+        # 添加图例
+        legend_y = 30
+        cv2.putText(vis_img, 'Legend:', (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(vis_img, 'Blue: Detection Areas (dt_polys)', (10, legend_y + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        cv2.putText(vis_img, 'Green: Recognition Areas (rec_boxes)', (10, legend_y + 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # 添加统计信息
+        stats_text = f'Detected: {len(dt_polys)}, Recognized: {len(rec_boxes)}'
+        cv2.putText(vis_img, stats_text, (10, legend_y + 75),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+        # 保存可视化结果
+        output_path = json_path.parent / f"{json_path.stem}_visualization.jpg"
+        cv2.imwrite(str(output_path), vis_img)
+
+        print(f"可视化结果已保存到: {output_path}")
+        print(f"检测区域数量: {len(dt_polys)}")
+        print(f"识别区域数量: {len(rec_boxes)}")
+
+        return str(output_path)
+
+    def _is_likely_subtitle_by_geometry(self, box_coords: list, text: str, img_height: int, img_width: int = None, debug_print: bool = False) -> bool:
         """
         基于几何特征判断文本是否可能是字幕
 
@@ -791,6 +855,7 @@ class VideoSubtitleExtractor:
             box_coords: 文本边界框坐标 [x1, y1, x2, y2]
             text: 文本内容
             img_height: 图片高度（用于计算相对高度）
+            img_width: 图片宽度（用于X轴中心点检测）
             debug_print: 是否打印调试信息
 
         Returns:
@@ -812,45 +877,71 @@ class VideoSubtitleExtractor:
         avg_char_width = width / char_count
         relative_height = height / img_height  # 使用实际图片高度计算相对高度
 
+        # X轴中心点穿过检测（新的主要过滤逻辑）
+        passes_center_axis = True
+        if img_width is not None:
+            img_center_x = img_width / 2
+            text_left_edge = x1
+            text_right_edge = x2
+
+            # 检查图片X轴中心点是否穿过文本区域
+            center_passes_through = text_left_edge <= img_center_x <= text_right_edge
+
+            if center_passes_through:
+                # 计算左右两边的宽度
+                left_width = img_center_x - text_left_edge
+                right_width = text_right_edge - img_center_x
+                total_text_width = text_right_edge - text_left_edge
+
+                # 计算左右宽度的相对比例
+                left_ratio = left_width / total_text_width if total_text_width > 0 else 0
+                right_ratio = right_width / total_text_width if total_text_width > 0 else 0
+
+                # 检查左右宽度是否在合理范围内（15%的容差）
+                min_ratio = 0.15  # 最小15%
+                max_ratio = 0.85  # 最大85%
+
+                passes_center_axis = (min_ratio <= left_ratio <= max_ratio) and (min_ratio <= right_ratio <= max_ratio)
+
+                if debug_print:
+                    print(f"      X轴中心检测: 中心点={img_center_x:.1f}, 文本范围=[{text_left_edge:.1f}, {text_right_edge:.1f}]")
+                    print(f"      左右比例: 左={left_ratio:.1%}, 右={right_ratio:.1%}, 通过={passes_center_axis}")
+            else:
+                passes_center_axis = False
+                if debug_print:
+                    print(f"      X轴中心检测: 中心点={img_center_x:.1f}未穿过文本范围[{text_left_edge:.1f}, {text_right_edge:.1f}]")
+
         # 基于分析结果的过滤规则（针对PP-OCRv5优化）
         is_wide_text = aspect_ratio > 1.6  # 宽高比大于1.6（字幕通常更宽扁）
         is_reasonable_height = relative_height < 0.5  # 相对高度小于50%（放宽阈值适应v5）
         is_reasonable_char_width = avg_char_width < 120  # 平均字符宽度小于120px（放宽阈值适应v5）
 
-        # 特殊规则：过滤明显的车牌模式
-        is_license_plate = self._is_license_plate_pattern(text)
+        # 车牌检测已移除
 
-        # 单字符特殊处理：对于单个汉字，放宽宽高比要求
-        import re
-        is_single_char = char_count == 1
-        is_chinese_char = bool(re.match(r'^[\u4e00-\u9fff]$', text))
+        # 单汉字特殊逻辑已移除，所有文本使用统一过滤规则
 
-        # 综合判断
-        if is_single_char and is_chinese_char:
-            # 单个汉字：只检查高度和模式，不检查宽高比
+        # 综合判断 - 以X轴中心点检测为主要条件
+        if passes_center_axis:
+            # 通过X轴中心点检测后，所有文本使用统一的几何特征检查
             passes_geometry = is_reasonable_height and is_reasonable_char_width
         else:
-            # 多字符：检查所有几何特征
-            passes_geometry = is_wide_text and is_reasonable_height and is_reasonable_char_width
+            # 如果未通过X轴中心点检测，直接过滤
+            passes_geometry = False
 
-        passes_pattern = not is_license_plate
-
-        result = passes_geometry and passes_pattern
+        # 移除车牌检测，仅依赖几何特征
+        result = passes_geometry
 
         if debug_print:
             print(f"      几何分析: 宽高比={aspect_ratio:.2f}, 相对高度={relative_height:.3f}, 字符宽度={avg_char_width:.1f}")
-            print(f"      规则检查: 宽扁={is_wide_text}, 高度合理={is_reasonable_height}, 字符合理={is_reasonable_char_width}")
-            print(f"      模式检查: 非车牌={not is_license_plate}")
+            print(f"      中心轴检测: {'通过' if passes_center_axis else '未通过'}")
+            if passes_center_axis:
+                print(f"      几何特征检查: 高度合理={is_reasonable_height}, 字符合理={is_reasonable_char_width}")
+            else:
+                print(f"      过滤原因: 未通过X轴中心点检测")
             print(f"      最终结果: {'通过' if result else '过滤'}")
 
         return result
 
-    def _is_license_plate_pattern(self, text: str) -> bool:
-        """检查是否为车牌号码模式"""
-        import re
-        # 中国车牌格式：地区码+字母+数字（支持·和-分隔符）
-        license_pattern = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领海][A-Z][·\-]?\d+$'
-        return bool(re.match(license_pattern, text))
 
 
     def _ocr_image(self, img, debug_print: bool = False) -> Dict:
@@ -869,8 +960,9 @@ class VideoSubtitleExtractor:
                 'raw_result': OCRResult
             }
         """
-        # 获取图片高度用于几何特征计算
+        # 获取图片尺寸用于几何特征计算
         img_height = img.shape[0] if img is not None and hasattr(img, 'shape') else 480
+        img_width = img.shape[1] if img is not None and hasattr(img, 'shape') else 1080
 
         # 进行OCR识别
         if debug_print:
@@ -968,7 +1060,7 @@ class VideoSubtitleExtractor:
                             if score > 0.5:  # 置信度阈值
                                 # 几何特征过滤
                                 box_coords = box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
-                                if self._is_likely_subtitle_by_geometry(box_coords, text, img_height, debug_print):
+                                if self._is_likely_subtitle_by_geometry(box_coords, text, img_height, img_width, debug_print):
                                     # 转换为简体中文
                                     simplified_text = self._convert_to_simplified(text)
 
@@ -1206,13 +1298,12 @@ class VideoSubtitleExtractor:
             print(f"处理失败: {e}")
             raise
 
-    def ocr_single_image(self, image_path: str, crop_region: bool = False, save_result: bool = False) -> Dict:
+    def ocr_single_image(self, image_path: str, save_result: bool = False) -> Dict:
         """
         对单张图片进行OCR识别
 
         Args:
             image_path: 图片文件路径
-            crop_region: 是否裁剪到字幕区域
             save_result: 是否保存结果到文件
 
         Returns:
@@ -1235,28 +1326,8 @@ class VideoSubtitleExtractor:
         height, width = img.shape[:2]
         print(f"图片尺寸: {width}x{height}")
 
-        # 如果需要裁剪到字幕区域
-        if crop_region:
-            # 计算字幕区域
-            bottom_y = int(height * (1 - self.subtitle_region_bottom))
-            top_y = int(height * (1 - self.subtitle_region_top))
-            crop_height = bottom_y - top_y
-
-            print(f"字幕区域: y={top_y} 到 y={bottom_y} (高度={crop_height}px, 占比{self.subtitle_region_bottom*100:.1f}%-{self.subtitle_region_top*100:.1f}%)")
-
-            # 裁剪图片
-            cropped_img = img[top_y:bottom_y, 0:width]
-
-            # 保存裁剪后的图片用于调试
-            crop_path = image_path.parent / f"{image_path.stem}_cropped{image_path.suffix}"
-            cv2.imwrite(str(crop_path), cropped_img)
-            print(f"裁剪后的图片已保存到: {crop_path}")
-
-            # 使用裁剪后的图片进行OCR
-            ocr_img = cropped_img
-        else:
-            print("使用完整图片进行OCR识别")
-            ocr_img = img
+        print("使用完整图片进行OCR识别")
+        ocr_img = img
 
         # 使用抽象的核心OCR识别方法
         try:
@@ -1266,7 +1337,6 @@ class VideoSubtitleExtractor:
             result_data = {
                 'image_path': str(image_path),
                 'image_size': f"{width}x{height}",
-                'cropped': crop_region,
                 'texts': core_result['texts'],
                 'combined_text': core_result['combined_text'],
                 'raw_result': core_result['raw_result']
@@ -1274,30 +1344,30 @@ class VideoSubtitleExtractor:
 
             # 保存结果到文件
             if save_result:
+                # 获取PaddleOCR原始结果（不进行任何过滤）
+                raw_ocr_result = self.ocr.predict(ocr_img, use_textline_orientation=True)
+
                 result_file = image_path.parent / f"{image_path.stem}_ocr_result.json"
 
-                # 创建可序列化的结果
+                # 创建可序列化的原始结果
                 save_data = {
-                    'image_path': result_data['image_path'],
-                    'image_size': result_data['image_size'],
-                    'cropped': result_data['cropped'],
-                    'combined_text': result_data['combined_text'],
-                    'texts': result_data['texts'],
-                    'text_count': len(result_data['texts'])
+                    'image_path': str(image_path),
+                    'image_size': f"{ocr_img.shape[1]}x{ocr_img.shape[0]}",
+                    'paddleocr_raw_result': self._serialize_ocr_result(raw_ocr_result)
                 }
 
                 import json
                 with open(result_file, 'w', encoding='utf-8') as f:
                     json.dump(save_data, f, ensure_ascii=False, indent=2)
 
-                print(f"识别结果已保存到: {result_file}")
+                print(f"PaddleOCR原始结果已保存到: {result_file}")
 
                 # 同时保存简单的文本文件
                 text_file = image_path.parent / f"{image_path.stem}_ocr_result.txt"
                 with open(text_file, 'w', encoding='utf-8') as f:
                     f.write(f"图片: {image_path}\n")
                     f.write(f"尺寸: {result_data['image_size']}\n")
-                    f.write(f"裁剪: {'是' if crop_region else '否'}\n")
+                    f.write(f"裁剪: 否\n")
                     f.write(f"识别文本数: {len(result_data['texts'])}\n\n")
                     f.write(f"合并文本: {result_data['combined_text']}\n\n")
                     f.write("详细结果:\n")
@@ -1331,6 +1401,12 @@ def main():
         type=str,
         help='单张图片OCR识别模式：指定图片文件路径'
     )
+    group.add_argument(
+        '--visualize-ocr',
+        type=str,
+        metavar='JSON_FILE',
+        help='可视化OCR结果：根据JSON文件在原图上绘制检测和识别区域'
+    )
     parser.add_argument(
         '-o', '--output',
         type=str,
@@ -1362,28 +1438,6 @@ def main():
         help='字幕区域顶部位置，距离底部的百分比（默认: 0.45，即45%%）'
     )
     parser.add_argument(
-        '--gpu',
-        action='store_true',
-        default=True,
-        help='使用GPU加速（默认开启，需要安装paddlepaddle-gpu）'
-    )
-    parser.add_argument(
-        '--cpu',
-        action='store_true',
-        help='强制使用CPU模式'
-    )
-    parser.add_argument(
-        '--preview',
-        action='store_true',
-        help='仅预览字幕区域，不进行OCR识别（用于调试字幕位置）'
-    )
-    parser.add_argument(
-        '--preview-times',
-        type=str,
-        default=None,
-        help='预览模式下的时间点（秒），用逗号分隔，如 "10,30,60,90"。不指定则自动选择多个时间点'
-    )
-    parser.add_argument(
         '--start-time',
         type=float,
         default=0,
@@ -1401,14 +1455,9 @@ def main():
         help='输出未合并的原始OCR结果到 *_raw.srt 文件（用于调试）'
     )
     parser.add_argument(
-        '--crop-region',
-        action='store_true',
-        help='单图OCR模式：是否裁剪到字幕区域（默认处理整张图片）'
-    )
-    parser.add_argument(
         '--save-result',
         action='store_true',
-        help='单图OCR模式：保存识别结果到文本文件'
+        help='单图OCR模式：保存PaddleOCR原始结果到JSON文件（不进行任何过滤）'
     )
 
     args = parser.parse_args()
@@ -1419,10 +1468,19 @@ def main():
         extract_fps=args.fps,
         subtitle_region_bottom=args.subtitle_bottom,
         subtitle_region_top=args.subtitle_top,
-        use_gpu=not args.cpu,
+        use_gpu=True,  # 自动检测GPU
         start_time=0,
         duration=None
     )
+
+    # 检查是否是可视化OCR结果模式
+    if args.visualize_ocr:
+        try:
+            output_path = extractor.visualize_ocr_result(args.visualize_ocr)
+            print(f"\n✓ 可视化完成: {output_path}")
+        except Exception as e:
+            print(f"✗ 可视化失败: {e}")
+        return
 
     # 检查是否是单图OCR模式
     if args.ocr_image:
@@ -1434,7 +1492,6 @@ def main():
             # 执行单图OCR
             result = extractor.ocr_single_image(
                 image_path=args.ocr_image,
-                crop_region=args.crop_region,
                 save_result=args.save_result
             )
 
@@ -1471,26 +1528,6 @@ def main():
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration 必须 > 0")
 
-    # 如果是预览模式
-    if args.preview:
-        print("=" * 50)
-        print("字幕区域预览模式")
-        print("=" * 50)
-        extractor.output_dir.mkdir(parents=True, exist_ok=True)
-        extractor.frames_dir.mkdir(parents=True, exist_ok=True)
-
-        # 解析预览时间点
-        preview_times = None
-        if args.preview_times:
-            try:
-                preview_times = [float(t.strip()) for t in args.preview_times.split(',')]
-                print(f"使用指定的时间点: {preview_times}")
-            except ValueError:
-                print(f"警告: 无法解析时间点 '{args.preview_times}'，将自动选择时间点")
-
-        extractor.preview_subtitle_region(args.video, preview_times)
-        print("\n提示：检查生成的图片，如果字幕位置不对，请调整 --subtitle-bottom 和 --subtitle-top 参数")
-        return
 
     # 处理视频
     extractor.process_video(args.video, args.output, debug_raw=args.debug_raw)
