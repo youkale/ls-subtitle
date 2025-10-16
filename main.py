@@ -361,26 +361,6 @@ class VideoSubtitleExtractor:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"ffmpeg执行失败: {e.stderr}")
 
-    def detect_subtitle_region(self, frame_path: str) -> Tuple[int, int, int, int]:
-        """
-        检测字幕区域（通常在视频底部）
-
-        Args:
-            frame_path: 帧图片路径
-
-        Returns:
-            字幕区域坐标 (x, y, width, height)
-        """
-        img = cv2.imread(frame_path)
-        height, width = img.shape[:2]
-
-        # 假设字幕在底部20%的区域
-        subtitle_height = int(height * 0.2)
-        subtitle_y = height - subtitle_height
-
-        return (0, subtitle_y, width, subtitle_height)
-
-
     def ocr_frames(self) -> Dict[str, Dict]:
         """
         对所有帧进行OCR识别（帧已经是裁剪后的字幕区域）
@@ -454,145 +434,14 @@ class VideoSubtitleExtractor:
 
         return results
 
-    def check_ocr_result(self, ocr_result: Dict[str, Dict], video_info: Dict) -> Dict[str, Dict]:
-        """
-        校验并整合OCR识别结果
-
-        参考: https://github.com/chenwr727/SubErase-Translate-Embed
-
-        主要功能：
-        1. 统计字幕的中心位置和高度
-        2. 过滤掉不在字幕区域的文本
-        3. 合并同一帧内相邻的文本
-        4. 填充连续帧之间的空白
-
-        Args:
-            ocr_result: OCR识别结果字典
-            video_info: 视频信息（包含分辨率）
-
-        Returns:
-            校验和整合后的OCR结果
-        """
-        if not ocr_result:
-            return {}
-
-        # 获取图像尺寸（从裁剪后的帧）
-        first_frame = next(iter(ocr_result.keys()))
-        img = cv2.imread(first_frame)
-        if img is None:
-            return ocr_result
-
-        img_height, img_width = img.shape[:2]
-
-        # 配置参数 - 大幅放宽容忍度以减少误过滤
-        width_delta = img_width * 0.5   # 水平位置容忍度（50%，原30%）
-        height_delta = img_height * 0.4  # 垂直位置容忍度（40%，原10%）
-        groups_tolerance = img_height * 0.5  # 分组容忍度（50%，原5%）
-
-        x_center_frame = img_width / 2
-
-        # 第一步：统计字幕的中心位置和高度
-        center_list = []
-        word_height_list = []
-
-        for frame_path, value in tqdm(ocr_result.items(), desc="统计字幕位置", unit="帧"):
-            xmin, ymin, xmax, ymax = value['box']
-            x_center = (xmin + xmax) / 2
-            y_center = (ymin + ymax) / 2
-
-            # 只统计靠近水平中心的文本
-            if x_center - width_delta < x_center_frame < x_center + width_delta:
-                center_list.append(y_center)
-                word_height_list.append(ymax - ymin)
-
-        if not center_list:
-            return ocr_result
-
-        # 使用分组统计找到最常见的字幕位置和高度
-        center = get_groups_mean(center_list, groups_tolerance)
-        word_height = get_groups_mean(word_height_list, groups_tolerance)
-
-        print(f"  检测到字幕中心位置: y={center:.0f}px (容忍±{height_delta:.0f}px)")
-        print(f"  检测到字幕平均高度: {word_height:.0f}px")
-
-        # 第二步：过滤并合并同一帧内的文本
-        filtered_result = {}
-
-        for frame_path, value in tqdm(ocr_result.items(), desc="过滤OCR结果", unit="帧"):
-            xmin, ymin, xmax, ymax = value['box']
-            y_center = (ymin + ymax) / 2
-            x_center = (xmin + xmax) / 2
-            text_height = ymax - ymin
-
-            # 检查是否在字幕区域内
-            if (center - height_delta < y_center < center + height_delta and
-                word_height - groups_tolerance <= text_height <= word_height + groups_tolerance):
-
-                # 检查多个文本项，看是否需要进一步合并
-                if 'items' in value and len(value['items']) > 1:
-                    # 合并相邻的文本项
-                    merged_text = value['text']
-                    merged_box = value['box']
-                else:
-                    merged_text = value['text']
-                    merged_box = value['box']
-
-                filtered_result[frame_path] = {
-                    'text': merged_text,
-                    'box': merged_box,
-                    'frame_index': value['frame_index']
-                }
-
-        # 第三步：填充连续帧之间的空白
-        if not filtered_result:
-            return {}
-
-        # 按帧索引排序
-        sorted_frames = sorted(filtered_result.items(), key=lambda x: x[1]['frame_index'])
-
-        final_result = {}
-        min_duration_frames = int(self.extract_fps * 0.3)  # 最小持续时间0.3秒
-
-        for i in range(len(sorted_frames)):
-            frame_path, value = sorted_frames[i]
-            frame_idx = value['frame_index']
-            text = value['text']
-
-            final_result[frame_path] = value
-
-            # 如果不是最后一帧，检查是否需要填充
-            if i < len(sorted_frames) - 1:
-                next_frame_path, next_value = sorted_frames[i + 1]
-                next_frame_idx = next_value['frame_index']
-                next_text = next_value['text']
-
-                # 如果文本相同且帧间隔不大，填充中间的帧
-                if text == next_text and (next_frame_idx - frame_idx) <= min_duration_frames:
-                    # 填充中间的帧
-                    for fill_idx in range(frame_idx + 1, next_frame_idx):
-                        fill_frame_name = f"frame_{fill_idx:06d}.jpg"
-                        fill_frame_path = str(self.frames_dir / fill_frame_name)
-
-                        if os.path.exists(fill_frame_path):
-                            final_result[fill_frame_path] = {
-                                'text': text,
-                                'box': value['box'],
-                                'frame_index': fill_idx
-                            }
-
-        print(f"  过滤前: {len(ocr_result)} 帧，过滤后: {len(filtered_result)} 帧，填充后: {len(final_result)} 帧")
-
-        return final_result
-
     def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, gap_time_threshold: float = 2.0) -> List[Dict]:
         """
-        智能合并字幕段，集成过滤与合并逻辑
+        智能合并字幕段，按正确顺序执行：过滤 → 合并 → 间隙填充
 
-        新的合并算法特性：
-        1. 智能相似度：2-4个汉字只要有(长度-1)个字符正确就匹配
-        2. 间隙填充：OCR识别失败时，如果有检测区域但无识别文字，延续前一帧文字
-        3. X轴中心点过滤：只处理通过图片X轴中心的文本区域
-        4. 繁体转简体：统一转换为简体中文进行比较
+        算法流程：
+        1. X轴中心点过滤：剔除不在字幕区域的文本
+        2. 智能相似度合并：合并相似文本（2-4个汉字只要(长度-1)个字符匹配）
+        3. 间隙填充：处理有检测区但无文字的帧（严格时间连续性）
 
         Args:
             ocr_results: OCR识别结果字典，包含所有帧的识别信息
@@ -605,87 +454,113 @@ class VideoSubtitleExtractor:
         if not ocr_results:
             return []
 
-        print(f"正在执行智能合并算法（相似度阈值: {similarity_threshold}，间隙填充阈值: {gap_time_threshold}s）...")
+        print(f"\n{'='*60}")
+        print(f"智能字幕合并算法")
+        print(f"{'='*60}")
+        print(f"配置参数:")
+        print(f"  - 相似度阈值: {similarity_threshold}")
+        print(f"  - 间隙填充阈值: {gap_time_threshold}秒")
+        print(f"  - 输入帧数: {len(ocr_results)} 帧")
+        print(f"\n[步骤 1/3] X轴中心点过滤 - 剔除无效识别区域")
 
-        # 按帧索引排序，获取所有帧信息
+        # 按帧索引排序
         sorted_results = sorted(ocr_results.items(), key=lambda x: x[1]['frame_index'])
 
-        # 第一步：处理所有帧，包括空帧和有检测区域但无识别文字的帧
-        processed_frames = []
+        # 步骤1：预处理 - 转换简体中文，应用X轴中心点过滤
+        filtered_frames = []
+        filtered_out_count = 0
+
         for frame_path, value in sorted_results:
             frame_idx = value['frame_index']
             text = value['text'].strip() if 'text' in value else ""
 
-            # 检查是否有检测区域（即使没有识别出文字）
-            has_detection_region = False
-            is_valid_subtitle_region = False
-
+            # X轴中心点过滤：检查检测区域是否有效
+            is_valid_region = True
             if 'raw_result' in value and value['raw_result']:
-                # 检查是否有检测到的文本区域
                 raw_result = value['raw_result']
-                if hasattr(raw_result, 'dt_polys') and raw_result.dt_polys:
-                    has_detection_region = True
-                    # 检查检测区域是否通过X轴中心点（过滤逻辑）
-                    is_valid_subtitle_region = self._check_detection_regions_validity(raw_result.dt_polys, frame_path)
+                # 检查是否有检测框
+                if isinstance(raw_result, list) and len(raw_result) > 0:
+                    if 'dt_polys' in raw_result[0] and raw_result[0]['dt_polys']:
+                        is_valid_region = self._check_detection_regions_validity(raw_result[0]['dt_polys'], frame_path)
+                        if not is_valid_region and text:
+                            filtered_out_count += 1
 
             # 转换为简体中文
             simplified_text = ""
             if text:
                 simplified_text = self._convert_to_simplified(text)
 
-            processed_frames.append({
+            # 提取置信度（从items中获取平均置信度）
+            confidence = 0.95  # 默认置信度
+            if 'items' in value and value['items']:
+                # 计算所有文本项的平均置信度
+                scores = [item.get('score', 0.95) for item in value['items']]
+                if scores:
+                    confidence = sum(scores) / len(scores)
+
+            # 保留所有帧（包括无文字但有检测区的帧，用于间隙填充）
+            filtered_frames.append({
                 'frame_index': frame_idx,
                 'frame_path': frame_path,
-                'original_text': text,
-                'simplified_text': simplified_text,
-                'has_detection_region': has_detection_region,
-                'is_valid_subtitle_region': is_valid_subtitle_region,
-                'has_recognized_text': bool(simplified_text)
+                'text': simplified_text if is_valid_region else "",
+                'has_text': bool(simplified_text and is_valid_region),
+                'has_detection': 'raw_result' in value and value['raw_result'] is not None,
+                'is_valid_region': is_valid_region,
+                'raw_result': value.get('raw_result'),
+                'confidence': confidence  # 添加置信度
             })
 
-        if not processed_frames:
+        text_frames_count = sum(1 for f in filtered_frames if f['has_text'])
+        print(f"  ✓ 过滤完成")
+        print(f"    - 剔除无效区域: {filtered_out_count} 帧")
+        print(f"    - 保留有效文本: {text_frames_count} 帧")
+
+        if text_frames_count == 0:
+            print(f"\n{'='*60}")
+            print(f"❌ 错误: 过滤后没有任何有效文本帧")
+            print(f"{'='*60}")
             return []
 
-        # 第二步：间隙填充算法
-        filled_frames = self._fill_recognition_gaps(processed_frames, gap_time_threshold)
-
-        # 第三步：智能合并算法
-        segments = []
+        # 步骤2：智能相似度合并（包括4个汉字以下的OCR识别错的的合并）
+        print(f"\n[步骤 2/3] 智能相似度合并")
+        print(f"  - 2-4字短文本智能识别")
+        print(f"  - 置信度优先选择")
+        merged_segments = []
         current_segment = None
         text_variants = []
 
-        for frame_data in filled_frames:
-            frame_idx = frame_data['frame_index']
-            text = frame_data['final_text']
-
-            # 跳过无效的字幕区域或空文本
-            if not text or not frame_data.get('is_valid_subtitle_region', True):
+        for frame_data in filtered_frames:
+            # 只处理有文字的帧
+            if not frame_data['has_text']:
                 continue
+
+            frame_idx = frame_data['frame_index']
+            text = frame_data['text']
+
+            # 获取置信度信息（如果有的话）
+            confidence = frame_data.get('confidence', 0.95)  # 默认置信度
 
             if current_segment is None:
                 # 开始新段
                 current_segment = {
                     'start_frame': frame_idx,
                     'end_frame': frame_idx,
-                    'text': text
+                    'text': text,
+                    'frame_indices': [frame_idx]
                 }
-                text_variants = [text]
+                text_variants = [{'text': text, 'confidence': confidence}]
             else:
                 # 计算时间戳
                 current_end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
                 new_start_time = frame_idx / self.extract_fps + self.start_time
-
-                # 使用智能相似度计算
-                similarity = smart_chinese_similarity(current_segment['text'], text)
-
-                # 计算时间间隔
                 time_gap = new_start_time - current_end_time
 
-                # 判断是否应该合并的条件：
-                # 1. 严格时间连续：前一句结束时间 = 当前句开始时间 且 文本相似
-                # 2. 短时间间隔：time_gap < 150ms 且 文本相似（处理1帧识别失败的情况）
-                is_time_continuous = abs(time_gap) < 0.001  # 允许1毫秒的浮点误差
-                is_short_gap = 0 < time_gap < 0.15  # 150毫秒内的短间隔
+                # 使用智能相似度计算（2-4个汉字特殊处理）
+                similarity = smart_chinese_similarity(current_segment['text'], text)
+
+                # 合并条件：相似度足够 且 时间连续（或短间隔）
+                is_time_continuous = abs(time_gap) < 0.001
+                is_short_gap = 0 < time_gap < 0.15
                 is_similar = similarity >= similarity_threshold
 
                 should_merge = is_similar and (is_time_continuous or is_short_gap)
@@ -693,24 +568,140 @@ class VideoSubtitleExtractor:
                 if should_merge:
                     # 延长当前段
                     current_segment['end_frame'] = frame_idx
-                    text_variants.append(text)
+                    current_segment['frame_indices'].append(frame_idx)
+                    text_variants.append({'text': text, 'confidence': confidence})
                 else:
-                    # 结束当前段，开始新段
-                    self._finalize_current_segment(current_segment, text_variants, segments)
+                    # 完成当前段
+                    current_segment['text'] = self._select_best_text_from_variants(text_variants)
+                    merged_segments.append(current_segment)
 
+                    # 开始新段
                     current_segment = {
                         'start_frame': frame_idx,
                         'end_frame': frame_idx,
-                        'text': text
+                        'text': text,
+                        'frame_indices': [frame_idx]
                     }
-                    text_variants = [text]
+                    text_variants = [{'text': text, 'confidence': confidence}]
 
         # 保存最后一段
         if current_segment:
-            self._finalize_current_segment(current_segment, text_variants, segments)
+            current_segment['text'] = self._select_best_text_from_variants(text_variants)
+            merged_segments.append(current_segment)
 
-        print(f"智能合并完成，得到 {len(segments)} 个字幕段")
-        return segments
+        print(f"  ✓ 合并完成")
+        print(f"    - 输入文本帧: {text_frames_count} 帧")
+        print(f"    - 合并后段落: {len(merged_segments)} 个")
+        print(f"    - 压缩率: {(1 - len(merged_segments) / text_frames_count) * 100:.1f}%")
+
+        # 步骤3：间隙填充 - 处理有识别区但OCR识别没有文字，且时间轴完全吻合的帧
+        print(f"\n[步骤 3/3] 间隙填充")
+        print(f"  - 处理有识别区但无文字的帧")
+        print(f"  - 时间轴连续性检查")
+        final_segments = self._fill_segment_gaps(merged_segments, filtered_frames, gap_time_threshold)
+
+        print(f"\n{'='*60}")
+        print(f"✓ 智能合并完成")
+        print(f"{'='*60}")
+        print(f"统计信息:")
+        print(f"  - 原始OCR帧数: {len(ocr_results)} 帧")
+        print(f"  - 有效文本帧数: {text_frames_count} 帧")
+        print(f"  - 最终段落数量: {len(final_segments)} 个")
+        print(f"  - 整体压缩率: {(1 - len(final_segments) / len(ocr_results)) * 100:.1f}%")
+        print(f"{'='*60}\n")
+        return final_segments
+
+    def _fill_segment_gaps(self, merged_segments: List[Dict], filtered_frames: List[Dict], gap_time_threshold: float) -> List[Dict]:
+        """
+        填充段落之间的间隙 - 处理有识别区但无文字的帧
+
+        当检测到文本区域但没有识别出文字时，如果前一帧的结尾与当前帧的开头完全吻合，
+        则延续前一段的文字。
+
+        Args:
+            merged_segments: 已合并的字幕段列表
+            filtered_frames: 所有经过预处理的帧数据列表
+            gap_time_threshold: 间隙填充的最大时间阈值（秒）
+
+        Returns:
+            填充间隙后的字幕段列表，包含时间戳
+        """
+        if not merged_segments:
+            return []
+
+        # 创建帧索引到帧数据的映射
+        frame_map = {f['frame_index']: f for f in filtered_frames}
+
+        # 扩展段落以填充间隙
+        extended_segments = []
+        gap_filled_count = 0
+
+        for seg_idx, segment in enumerate(merged_segments):
+            start_frame = segment['start_frame']
+            end_frame = segment['end_frame']
+            text = segment['text']
+
+            # 尝试向后扩展（填充后续有检测区但无文字的帧）
+            extended_end_frame = end_frame
+
+            # 检查后续帧
+            next_frame_idx = end_frame + 1
+            while True:
+                # 如果是最后一个段落，可以扩展到下一个有文字的帧之前
+                if seg_idx < len(merged_segments) - 1:
+                    next_segment_start = merged_segments[seg_idx + 1]['start_frame']
+                    # 不能扩展到下一个段落的开始位置
+                    if next_frame_idx >= next_segment_start:
+                        break
+
+                # 检查这一帧是否存在
+                if next_frame_idx not in frame_map:
+                    break
+
+                frame_data = frame_map[next_frame_idx]
+
+                # 检查是否有检测区但无文字，且是有效区域
+                if (frame_data['has_detection'] and
+                    not frame_data['has_text'] and
+                    frame_data['is_valid_region']):
+
+                    # 计算时间间隔（前一帧结尾与当前帧开头的间隔）
+                    prev_end_time = (extended_end_frame + 1) / self.extract_fps + self.start_time
+                    curr_start_time = next_frame_idx / self.extract_fps + self.start_time
+                    time_gap = curr_start_time - prev_end_time
+
+                    # 时间轴完全吻合（连续）或间隔很小
+                    if abs(time_gap) < 0.001:
+                        extended_end_frame = next_frame_idx
+                        gap_filled_count += 1
+                        next_frame_idx += 1
+                    else:
+                        # 时间不连续，停止扩展
+                        break
+                else:
+                    # 这一帧有文字或没有检测区，停止扩展
+                    break
+
+            # 计算最终时间戳
+            start_time = start_frame / self.extract_fps + self.start_time
+            end_time = (extended_end_frame + 1) / self.extract_fps + self.start_time
+
+            extended_segments.append({
+                'text': text,
+                'start_time': start_time,
+                'end_time': end_time,
+                'start_frame': start_frame,
+                'end_frame': extended_end_frame
+            })
+
+        print(f"  ✓ 间隙填充完成")
+        if gap_filled_count > 0:
+            print(f"    - 填充帧数: {gap_filled_count} 帧")
+            print(f"    - 扩展段落: {sum(1 for s in extended_segments if s['end_frame'] > merged_segments[i]['end_frame'] for i, s in enumerate(extended_segments) if i < len(merged_segments))} 个")
+        else:
+            print(f"    - 无需填充")
+
+        return extended_segments
 
     def _check_detection_regions_validity(self, dt_polys, frame_path: str) -> bool:
         """
@@ -779,82 +770,11 @@ class VideoSubtitleExtractor:
             # 出错时保守处理，认为是有效区域
             return True
 
-    def _fill_recognition_gaps(self, processed_frames: List[Dict], gap_time_threshold: float) -> List[Dict]:
-        """
-        填充OCR识别失败的间隙
-
-        当检测到文本区域但没有识别出文字时，如果前一帧有识别结果，
-        且时间间隔在阈值内，则延续前一帧的文字。
-
-        Args:
-            processed_frames: 处理过的帧数据列表
-            gap_time_threshold: 间隙填充的最大时间阈值（秒）
-
-        Returns:
-            填充后的帧数据列表
-        """
-        if not processed_frames:
-            return []
-
-        filled_frames = []
-        last_valid_text = ""
-        last_valid_frame_idx = -1
-
-        for frame_data in processed_frames:
-            frame_idx = frame_data['frame_index']
-            has_text = frame_data['has_recognized_text']
-            has_detection = frame_data['has_detection_region']
-            is_valid_region = frame_data['is_valid_subtitle_region']
-            simplified_text = frame_data['simplified_text']
-
-            # 计算当前帧的时间
-            current_time = frame_idx / self.extract_fps + self.start_time
-            last_valid_time = last_valid_frame_idx / self.extract_fps + self.start_time if last_valid_frame_idx >= 0 else 0
-
-            final_text = simplified_text
-            is_gap_filled = False
-
-            # 间隙填充逻辑
-            if (not has_text and has_detection and is_valid_region and
-                last_valid_text and last_valid_frame_idx >= 0):
-
-                time_gap = current_time - last_valid_time
-
-                # 如果时间间隔在阈值内，延续前一帧的文字
-                if time_gap <= gap_time_threshold:
-                    final_text = last_valid_text
-                    is_gap_filled = True
-
-            # 更新最后有效的文字和帧索引
-            if has_text and simplified_text:
-                last_valid_text = simplified_text
-                last_valid_frame_idx = frame_idx
-
-            # 创建填充后的帧数据
-            filled_frame_data = frame_data.copy()
-            filled_frame_data['final_text'] = final_text
-            filled_frame_data['is_gap_filled'] = is_gap_filled
-
-            filled_frames.append(filled_frame_data)
-
-        # 统计填充信息
-        gap_filled_count = sum(1 for f in filled_frames if f.get('is_gap_filled', False))
-        if gap_filled_count > 0:
-            print(f"  间隙填充: 填充了 {gap_filled_count} 个识别失败的帧")
-
-        return filled_frames
-
-    def _normalize_text(self, text: str) -> str:
-        """标准化文本，繁体转简体，去除标点符号和空格，用于相似度比较"""
-        import re
-
-        # 1. 繁体转简体
+    def _convert_to_simplified(self, text: str) -> str:
+        """将文本转换为简体中文"""
         if self.cc and text:
-            text = self.cc.convert(text)
-
-        # 2. 去除标点符号和空格
-        normalized = re.sub(r'[^\w\u4e00-\u9fff]', '', text)
-        return normalized.lower()
+            return self.cc.convert(text)
+        return text
 
     def _serialize_ocr_result(self, ocr_result) -> dict:
         """
@@ -1213,55 +1133,20 @@ class VideoSubtitleExtractor:
             raise
 
 
-    def _is_likely_same_text(self, text1: str, text2: str) -> bool:
-        """判断两个文本是否可能是同一句话（考虑OCR常见错误）"""
-        if not text1 or not text2:
-            return False
-
-        # 长度差异太大，不太可能是同一句话
-        if abs(len(text1) - len(text2)) > max(len(text1), len(text2)) * 0.3:
-            return False
-
-        # 检查是否有足够的共同字符
-        common_chars = set(text1) & set(text2)
-        min_len = min(len(text1), len(text2))
-
-        return len(common_chars) >= min_len * 0.6
-
-
-    def _finalize_current_segment(self, current_segment: Dict, text_variants: List[str], segments: List[Dict]):
-        """完成当前段落并添加到结果中"""
-        if not current_segment:
-            return
-
-        # 使用智能多帧内容合并算法选择最佳文本
-        if text_variants:
-            final_text = self._select_best_text_from_variants(text_variants)
-        else:
-            final_text = current_segment['text']
-
-        # 计算时间戳
-        start_time = current_segment['start_frame'] / self.extract_fps + self.start_time
-        end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
-
-        segments.append({
-            'text': final_text,
-            'start_time': start_time,
-            'end_time': end_time
-        })
-
-    def _select_best_text_from_variants(self, text_variants: List[str]) -> str:
+    def _select_best_text_from_variants(self, text_variants: List) -> str:
         """
         智能多帧内容合并算法：从多个文本变体中选择最佳文本
 
-        算法策略：
-        1. 字符频率统计：统计每个位置上出现最多的字符
-        2. 完整性优先：优先选择完整、无缺失的文本
-        3. 一致性验证：确保选择的文本在多帧中都有出现
-        4. 长度合理性：避免选择异常长或短的文本
+        算法策略（按优先级）：
+        1. 置信度优先：优先选择高置信度的文本
+        2. 字符频率统计：统计每个位置上出现最多的字符
+        3. 完整性优先：优先选择完整、无缺失的文本
+        4. 一致性验证：确保选择的文本在多帧中都有出现
+        5. 长度合理性：避免选择异常长或短的文本
 
         Args:
             text_variants: 多帧中收集的文本变体列表
+                         可以是字符串列表（兼容旧版）或字典列表 [{'text': str, 'confidence': float}]
 
         Returns:
             选择的最佳文本
@@ -1269,22 +1154,53 @@ class VideoSubtitleExtractor:
         if not text_variants:
             return ""
 
+        # 兼容旧版：如果是字符串列表，转换为字典列表
+        if isinstance(text_variants[0], str):
+            text_variants = [{'text': t, 'confidence': 0.95} for t in text_variants]
+
         if len(text_variants) == 1:
-            return text_variants[0]
+            return text_variants[0]['text']
 
-        # 转换为简体中文并去重
+        # 策略1: 置信度优先 - 如果有明显高置信度的文本，优先选择
+        # 按置信度排序
+        sorted_by_confidence = sorted(text_variants, key=lambda x: x.get('confidence', 0.0), reverse=True)
+        highest_confidence = sorted_by_confidence[0].get('confidence', 0.0)
+
+        # 如果最高置信度明显高于其他（差距>0.1），直接选择
+        if len(sorted_by_confidence) > 1:
+            second_confidence = sorted_by_confidence[1].get('confidence', 0.0)
+            if highest_confidence - second_confidence > 0.1:
+                return sorted_by_confidence[0]['text']
+
+        # 如果最高置信度的文本有多个，选择其中最长的
+        high_confidence_variants = [v for v in text_variants if v.get('confidence', 0.0) >= highest_confidence - 0.05]
+        if len(high_confidence_variants) == 1:
+            return high_confidence_variants[0]['text']
+
+        # 转换为简体中文并去重（只处理高置信度的文本）
         normalized_variants = []
-        original_mapping = {}  # 标准化文本 -> 原始文本列表
+        original_mapping = {}  # 标准化文本 -> (原始文本, 置信度) 列表
+        confidence_mapping = {}  # 标准化文本 -> 平均置信度
 
-        for text in text_variants:
+        for variant in high_confidence_variants:
+            text = variant['text']
+            confidence = variant.get('confidence', 0.95)
             normalized = self._convert_to_simplified(text) if text else ""
             normalized_variants.append(normalized)
 
             if normalized not in original_mapping:
                 original_mapping[normalized] = []
+                confidence_mapping[normalized] = []
             original_mapping[normalized].append(text)
+            confidence_mapping[normalized].append(confidence)
 
-        # 策略1: 如果有完全相同的文本占多数，直接选择
+        # 计算每个标准化文本的平均置信度
+        avg_confidence = {
+            text: sum(scores) / len(scores)
+            for text, scores in confidence_mapping.items()
+        }
+
+        # 策略2: 如果有完全相同的文本占多数，选择置信度最高的那个
         text_counts = {}
         for normalized in normalized_variants:
             text_counts[normalized] = text_counts.get(normalized, 0) + 1
@@ -1293,23 +1209,30 @@ class VideoSubtitleExtractor:
         max_count = max(text_counts.values())
         most_frequent_texts = [text for text, count in text_counts.items() if count == max_count]
 
-        # 如果只有一个最频繁的文本，且出现次数超过总数的50%，直接选择
+        # 如果只有一个最频繁的文本，且出现次数超过总数的50%
         if len(most_frequent_texts) == 1 and max_count > len(text_variants) * 0.5:
             best_normalized = most_frequent_texts[0]
-            # 从原始文本中选择最长的版本
-            return max(original_mapping[best_normalized], key=len)
+            # 从原始文本中选择置信度最高的版本
+            texts_with_conf = list(zip(original_mapping[best_normalized], confidence_mapping[best_normalized]))
+            return max(texts_with_conf, key=lambda x: (x[1], len(x[0])))[0]
 
-        # 策略2: 字符级别的投票算法
-        if len(most_frequent_texts) > 1 or max_count <= len(text_variants) * 0.5:
+        # 如果有多个最频繁的文本，选择平均置信度最高的
+        if len(most_frequent_texts) > 1:
+            best_normalized = max(most_frequent_texts, key=lambda t: (avg_confidence[t], len(t)))
+            texts_with_conf = list(zip(original_mapping[best_normalized], confidence_mapping[best_normalized]))
+            return max(texts_with_conf, key=lambda x: (x[1], len(x[0])))[0]
+
+        # 策略3: 字符级别的投票算法
+        if max_count <= len(text_variants) * 0.5:
             consensus_text = self._build_consensus_text(normalized_variants)
             if consensus_text:
-                # 找到与共识文本最相似的原始文本
-                best_original = self._find_most_similar_original(consensus_text, text_variants)
+                # 找到与共识文本最相似且置信度高的原始文本
+                all_texts = [v['text'] for v in high_confidence_variants]
+                best_original = self._find_most_similar_original(consensus_text, all_texts)
                 return best_original
 
-        # 策略3: 回退到传统方法 - 选择最长的最频繁文本
-        best_normalized = max(most_frequent_texts, key=len)
-        return max(original_mapping[best_normalized], key=len)
+        # 策略4: 回退 - 选择置信度最高的文本
+        return sorted_by_confidence[0]['text']
 
     def _build_consensus_text(self, text_variants: List[str]) -> str:
         """
@@ -1467,8 +1390,6 @@ class VideoSubtitleExtractor:
             segments: 字幕段列表
             output_path: 输出文件路径
         """
-        print(f"正在生成SRT文件: {output_path}")
-
         with open(output_path, 'w', encoding='utf-8') as f:
             for idx, segment in enumerate(segments, 1):
                 start_time = self.format_timestamp(segment['start_time'])
@@ -1479,8 +1400,6 @@ class VideoSubtitleExtractor:
                 f.write(f"{start_time} --> {end_time}\n")
                 f.write(f"{text}\n")
                 f.write("\n")
-
-        print(f"SRT文件已保存")
 
     def process_video(self, video_path: str, output_srt_path: str = None, debug_raw: bool = False):
         """
@@ -1505,44 +1424,64 @@ class VideoSubtitleExtractor:
         else:
             output_srt_path = Path(output_srt_path)
 
+        print(f"\n{'='*80}")
+        print(f"视频字幕提取流程")
+        print(f"{'='*80}")
+        print(f"输入视频: {video_path.name}")
+        print(f"输出文件: {output_srt_path}")
+        print(f"{'='*80}\n")
+
         try:
             # 步骤1: 获取视频信息
+            print(f"[1/4] 获取视频信息")
             video_info = self.get_video_info(str(video_path))
+            print(f"  ✓ 视频信息获取完成\n")
 
             # 步骤2: 提取视频帧
+            print(f"[2/4] 提取视频帧")
             frame_count = self.extract_frames(str(video_path), video_info['fps'])
 
             if frame_count == 0:
                 raise RuntimeError("未能提取任何视频帧")
+            print(f"  ✓ 帧提取完成\n")
 
             # 步骤3: OCR识别
+            print(f"[3/4] OCR文字识别")
             raw_ocr_results = self.ocr_frames()
+            print(f"  ✓ OCR识别完成\n")
 
-            # 步骤4: 智能合并字幕段（直接处理原始OCR结果，包含空帧）
-            print("正在执行智能合并...")
+            # 步骤4: 智能合并字幕段
+            print(f"[4/4] 智能合并处理")
             segments = self.merge_subtitle_segments(raw_ocr_results)
 
             # 步骤4.5: 如果需要，输出原始未合并的调试文件
             if debug_raw:
                 raw_output_path = output_srt_path.parent / f"{output_srt_path.stem}_raw.srt"
-                print(f"\n生成原始OCR调试文件: {raw_output_path}")
+                print(f"\n[调试] 生成原始OCR调试文件")
                 raw_segments = self.generate_raw_segments(raw_ocr_results)
                 self.generate_srt(raw_segments, str(raw_output_path))
-                print(f"原始段落数: {len(raw_segments)} 个")
+                print(f"  ✓ 调试文件: {raw_output_path}")
+                print(f"  ✓ 原始段落数: {len(raw_segments)} 个\n")
 
-            # 注意：不再使用 check_ocr_result，因为智能合并算法已经集成了过滤逻辑
-
-            # 步骤6: 生成SRT文件
+            # 步骤5: 生成SRT文件
             self.generate_srt(segments, str(output_srt_path))
 
-            print(f"\n处理完成！")
-            print(f"SRT文件: {output_srt_path}")
+            print(f"{'='*80}")
+            print(f"✓ 处理完成！")
+            print(f"{'='*80}")
+            print(f"输出文件: {output_srt_path}")
+            print(f"段落数量: {len(segments)} 个")
+            print(f"{'='*80}\n")
 
             # 清理临时帧文件（可选）
             # shutil.rmtree(self.frames_dir)
 
         except Exception as e:
-            print(f"处理失败: {e}")
+            print(f"\n{'='*80}")
+            print(f"❌ 处理失败")
+            print(f"{'='*80}")
+            print(f"错误信息: {e}")
+            print(f"{'='*80}\n")
             raise
 
     def ocr_single_image(self, image_path: str, save_result: bool = False) -> Dict:
