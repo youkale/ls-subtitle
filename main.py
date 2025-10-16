@@ -977,13 +977,15 @@ class VideoSubtitleExtractor:
 
 
 
-    def _ocr_image(self, img, debug_print: bool = False) -> Dict:
+    def _ocr_image(self, img, debug_print: bool = False, apply_x_filter: bool = False, frame_path: str = None) -> Dict:
         """
         核心的单张图片OCR识别逻辑
 
         Args:
             img: OpenCV图片对象 (numpy.ndarray)
             debug_print: 是否打印调试信息
+            apply_x_filter: 是否应用X轴中心点过滤（过滤非字幕区域）
+            frame_path: 帧文件路径（用于X轴过滤时获取图片尺寸）
 
         Returns:
             Dict: 包含识别结果的字典
@@ -1091,11 +1093,27 @@ class VideoSubtitleExtractor:
                                 print(f"  检测到文本 {j+1}: \"{text}\" (置信度: {score:.3f})")
 
                             if score > 0.5:  # 置信度阈值
-                                # 转换为简体中文
-                                simplified_text = self._convert_to_simplified(text)
-
                                 # 获取边界框坐标
                                 box_coords = box if isinstance(box, list) else box.tolist() if hasattr(box, 'tolist') else [0, 0, 100, 30]
+
+                                # X轴中心点过滤（如果启用）
+                                if apply_x_filter:
+                                    # 计算文本框的中心点X坐标
+                                    center_x = (box_coords[0] + box_coords[2]) / 2
+                                    img_center_x = img_width / 2
+                                    tolerance_ratio = 0.15  # 15%的容忍度
+                                    tolerance = img_width * tolerance_ratio
+
+                                    # 检查是否在字幕中心区域
+                                    is_in_center = abs(center_x - img_center_x) <= tolerance
+
+                                    if not is_in_center:
+                                        if debug_print:
+                                            print(f"    ✗ 跳过: X轴偏离中心 (中心X={center_x:.1f}, 图片中心={img_center_x:.1f}, 容忍±{tolerance:.1f})")
+                                        continue
+
+                                # 转换为简体中文
+                                simplified_text = self._convert_to_simplified(text)
 
                                 text_info = {
                                     'text': text,
@@ -1106,7 +1124,11 @@ class VideoSubtitleExtractor:
                                 result_data['texts'].append(text_info)
 
                                 if debug_print:
-                                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
+                                    if apply_x_filter:
+                                        center_x = (box_coords[0] + box_coords[2]) / 2
+                                        print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f}, 中心X={center_x:.1f})")
+                                    else:
+                                        print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
                             else:
                                 if debug_print:
                                     print(f"    ✗ 跳过: 置信度过低 ({score:.3f} < 0.5)")
@@ -1487,13 +1509,14 @@ class VideoSubtitleExtractor:
             print(f"{'='*80}\n")
             raise
 
-    def ocr_single_image(self, image_path: str, save_result: bool = False) -> Dict:
+    def ocr_single_image(self, image_path: str, save_result: bool = False, apply_x_filter: bool = True) -> Dict:
         """
         对单张图片进行OCR识别
 
         Args:
             image_path: 图片文件路径
             save_result: 是否保存结果到文件
+            apply_x_filter: 是否应用X轴中心点过滤（默认True，过滤非字幕区域）
 
         Returns:
             OCR识别结果
@@ -1516,11 +1539,15 @@ class VideoSubtitleExtractor:
         print(f"图片尺寸: {width}x{height}")
 
         print("使用完整图片进行OCR识别")
+        if apply_x_filter:
+            print("✓ 已启用X轴中心点过滤（仅保留字幕区域文本）")
+        else:
+            print("⚠️  已禁用X轴中心点过滤（显示所有检测到的文本）")
         ocr_img = img
 
         # 使用抽象的核心OCR识别方法
         try:
-            core_result = self._ocr_image(ocr_img, debug_print=True)
+            core_result = self._ocr_image(ocr_img, debug_print=True, apply_x_filter=apply_x_filter, frame_path=str(image_path))
 
             # 构建完整的结果数据
             result_data = {
@@ -1648,6 +1675,11 @@ def main():
         action='store_true',
         help='单图OCR模式：保存PaddleOCR原始结果到JSON文件（不进行任何过滤）'
     )
+    parser.add_argument(
+        '--no-x-filter',
+        action='store_true',
+        help='单图OCR模式：禁用X轴中心点过滤（显示所有检测到的文本）'
+    )
 
     args = parser.parse_args()
 
@@ -1681,7 +1713,8 @@ def main():
             # 执行单图OCR
             result = extractor.ocr_single_image(
                 image_path=args.ocr_image,
-                save_result=args.save_result
+                save_result=args.save_result,
+                apply_x_filter=not args.no_x_filter  # 默认启用X轴过滤，除非用户指定 --no-x-filter
             )
 
             print("\n" + "=" * 50)
