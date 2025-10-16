@@ -506,7 +506,8 @@ class VideoSubtitleExtractor:
                 tqdm.write(f"批量识别调试: 处理帧 {frame_path.name}")
 
             try:
-                ocr_result = self._ocr_image(img, debug_print=debug_print)
+                # 启用X轴中心点过滤，过滤非字幕区域的干扰文字
+                ocr_result = self._ocr_image(img, debug_print=debug_print, apply_x_filter=True, frame_path=str(frame_path))
 
                 # 从文件名提取真实的帧索引
                 frame_name = frame_path.stem  # frame_000708
