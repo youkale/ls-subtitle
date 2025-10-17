@@ -1594,24 +1594,9 @@ class VideoSubtitleExtractor:
             # 规范化边界框
             box_coords = _normalize_box_coords(box)
 
-            # 几何尺寸过滤（优先检查，过滤掉异常大的文本框）
-            if apply_x_filter and img_height:
-                size_valid, width_ratio, height_ratio, area_ratio = _is_valid_text_box_size(
-                    box_coords, img_width, img_height
-                )
-
-                if not size_valid:
-                    if debug_print:
-                        x1, y1, x2, y2 = box_coords
-                        box_width = x2 - x1
-                        box_height = y2 - y1
-                        print(f"    ✗ 跳过: 文本框尺寸异常")
-                        print(f"       文本框: [{x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f}]")
-                        print(f"       尺寸: {box_width:.0f}×{box_height:.0f}px")
-                        print(f"       宽度占比: {width_ratio:.1%} (限制: 5%-95%)")
-                        print(f"       高度占比: {height_ratio:.1%} (限制: 3%-40%)")
-                        print(f"       面积占比: {area_ratio:.1%} (限制: ≤35%)")
-                    continue
+            # 尺寸过滤已移除，仅使用X轴过滤作为判断标准
+            # 原因：X轴过滤已经能有效判断是否为字幕区域
+            # 尺寸过滤容易误杀宽度较大的合法字幕（如长句子）
 
             # X轴中心点过滤
             if apply_x_filter:
