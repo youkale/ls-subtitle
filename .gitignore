@@ -25,3 +25,4 @@ output/
 .paddleocr/
 *.srt
 examples/
+.DS_Store
