@@ -157,26 +157,32 @@ def _extract_ocr_data_from_item(item) -> tuple:
     return rec_texts, rec_scores, boxes
 
 
-def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio: float = 0.15) -> tuple:
+def _is_text_in_center_region(box_coords: list, img_width: int, min_side_ratio: float = 0.25) -> tuple:
     """
-    检查文本框是否跨越中轴线且左右比例符合要求（纯函数）
+    检查文本框是否在中心区域（简化对称算法）
 
-    逻辑：
-    1. 对于短文本（宽度<30%图片宽度）：使用宽松的中心点距离判断
-    2. 对于长文本：文本框必须跨越图片的X轴中线，且左右比例为30:70
+    核心逻辑：
+    1. 短文本（宽度<30%图片宽度）：使用宽松的中心点距离判断
+    2. 长文本：必须跨越中轴线，且最小侧占比≥min_side_ratio（默认25%）
 
-    短文本宽松判断原因：
-    - 短文本如"董事长"（3个字）文本框较窄，容易不跨越中轴线
-    - 只需要文本中心点在合理范围内（±25%）即可
+    算法优势：
+    - 更简洁直观：单一参数控制左右平衡性
+    - 自动对称：min(left, right) / width ≥ 25%，等价于允许25%-75%的比例范围
+    - 易于调整：可通过min_side_ratio参数灵活控制严格程度
 
-    长文本严格判断原因：
-    - 长文本应该居中显示，跨越中轴线
-    - 左右比例30%-70%，允许OCR识别偏右
+    短文本特殊处理原因：
+    - 短文本如"董事长"（3个字）文本框较窄，可能不跨越中轴线
+    - 只需要中心点在合理范围内（±25%，即中间50%区域）
+
+    长文本判断原则：
+    - 必须跨越中轴线（保证居中）
+    - 最小的一侧至少占25%（保证不会过度偏移）
+    - 例如：25%-75%、30%-70%、50%-50%都能通过，但20%-80%会被过滤
 
     Args:
         box_coords: 边界框坐标 [xmin, ymin, xmax, ymax]
         img_width: 图片宽度
-        tolerance_ratio: 左右偏移容忍度（保留兼容性）
+        min_side_ratio: 最小侧占比阈值，默认0.25（即25%）
 
     Returns:
         (is_valid, center_x, center_line, left_ratio) 元组
@@ -201,27 +207,28 @@ def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio:
         # 返回0.5作为left_ratio，表示使用了宽松判断
         return is_valid, center_x, center_line, 0.5
 
-    # 对长文本使用严格的跨越中轴线判断
-    # 检查文本框是否跨越中轴线
+    # 对长文本使用简化对称算法
+    # 步骤1：检查文本框是否跨越中轴线
     crosses_center = x1 < center_line < x2
 
     if not crosses_center:
         # 不跨越中轴线，直接判定为不通过
         return False, center_x, center_line, 0.0
 
-    # 计算文本框左右比例
-    left_part = center_line - x1  # 中轴线左侧的部分
-    right_part = x2 - center_line  # 中轴线右侧的部分
+    # 步骤2：计算左右两侧的宽度和比例
+    left_part = center_line - x1  # 中轴线左侧的部分（像素）
+    right_part = x2 - center_line  # 中轴线右侧的部分（像素）
 
     left_ratio = left_part / width
     right_ratio = right_part / width
 
-    # 允许的比例范围：30%-70%
-    min_ratio = 0.3
-    max_ratio = 0.7
+    # 步骤3：计算最小侧的比例
+    min_side = min(left_part, right_part)
+    min_ratio = min_side / width
 
-    # 左侧和右侧都要在30%-70%范围内
-    is_valid = (min_ratio <= left_ratio <= max_ratio) and (min_ratio <= right_ratio <= max_ratio)
+    # 步骤4：判断最小侧是否满足阈值
+    # 例如：如果min_side_ratio=0.25，则允许25%-75%的比例范围
+    is_valid = min_ratio >= min_side_ratio
 
     return is_valid, center_x, center_line, left_ratio
 
@@ -243,9 +250,9 @@ def _is_valid_text_box_size(box_coords: list, img_width: int, img_height: int) -
     目的: 过滤掉异常大的文本框（如全屏误检测、背景元素）
 
     正常字幕特征:
-    - 宽度: 5% - 85% 画面宽度
+    - 宽度: 5% - 95% 画面宽度（允许长字幕）
     - 高度: 3% - 40% 画面高度（考虑不同分辨率和双行字幕）
-    - 面积: 不超过30% 画面面积
+    - 面积: 不超过35% 画面面积（放宽以适应长字幕）
 
     异常案例:
     - 文本框 [116, 0, 1080, 480] 在 1080×480 画面中
@@ -279,9 +286,9 @@ def _is_valid_text_box_size(box_coords: list, img_width: int, img_height: int) -
     area_ratio = box_area / img_area if img_area > 0 else 0
 
     # 尺寸阈值
-    max_width_ratio = 0.85    # 最大宽度：85%
+    max_width_ratio = 0.95    # 最大宽度：95%（允许长字幕）
     max_height_ratio = 0.40   # 最大高度：40%（考虑不同分辨率和双行字幕）
-    max_area_ratio = 0.30     # 最大面积：30%（放宽以适应正常字幕）
+    max_area_ratio = 0.35     # 最大面积：35%（放宽以适应长字幕）
     min_width_ratio = 0.05    # 最小宽度：5%（过滤噪点）
     min_height_ratio = 0.03   # 最小高度：3%（过滤噪点）
 
@@ -1463,8 +1470,8 @@ class VideoSubtitleExtractor:
         # 添加说明文字
         cv2.putText(vis_img, 'X-axis Filter: Text box must cross center line', (10, img_height - 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(vis_img, 'with 30%-70% on each side', (10, img_height - 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(vis_img, 'with min side ratio >= 25% (allows 25%-75% range)', (10, img_height - 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
         # 添加图例
         legend_y = 50
@@ -1601,9 +1608,9 @@ class VideoSubtitleExtractor:
                         print(f"    ✗ 跳过: 文本框尺寸异常")
                         print(f"       文本框: [{x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f}]")
                         print(f"       尺寸: {box_width:.0f}×{box_height:.0f}px")
-                        print(f"       宽度占比: {width_ratio:.1%} (限制: 5%-85%)")
+                        print(f"       宽度占比: {width_ratio:.1%} (限制: 5%-95%)")
                         print(f"       高度占比: {height_ratio:.1%} (限制: 3%-40%)")
-                        print(f"       面积占比: {area_ratio:.1%} (限制: ≤30%)")
+                        print(f"       面积占比: {area_ratio:.1%} (限制: ≤35%)")
                     continue
 
             # X轴中心点过滤
@@ -1622,7 +1629,10 @@ class VideoSubtitleExtractor:
                         print(f"       中轴线: X={center_line:.0f}")
                         print(f"       是否跨越中轴线: {crosses}")
                         if left_ratio > 0:
-                            print(f"       左右比例: {left_ratio:.1%} : {right_ratio:.1%} (要求: 30%-70%)")
+                            min_side_ratio = min(left_ratio, right_ratio)
+                            print(f"       左右比例: {left_ratio:.1%} : {right_ratio:.1%}")
+                            print(f"       最小侧占比: {min_side_ratio:.1%}")
+                            print(f"       要求: 最小侧≥25% (允许25%-75%范围)")
                     continue
 
             # 转换为简体中文并保存
@@ -1643,10 +1653,12 @@ class VideoSubtitleExtractor:
                     width = x2 - x1
                     center_line = img_width / 2
                     left_part = center_line - x1
+                    right_part = x2 - center_line
                     left_ratio = left_part / width if width > 0 else 0
-                    right_ratio = 1 - left_ratio
+                    right_ratio = right_part / width if width > 0 else 0
+                    min_side_ratio = min(left_ratio, right_ratio)
                     print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
-                    print(f"       文本框跨越中轴线, 左右比例: {left_ratio:.1%} : {right_ratio:.1%}")
+                    print(f"       文本框跨越中轴线, 左右比例: {left_ratio:.1%} : {right_ratio:.1%}, 最小侧: {min_side_ratio:.1%}")
                 else:
                     print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
 
