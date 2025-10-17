@@ -162,28 +162,46 @@ def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio:
     检查文本框是否跨越中轴线且左右比例符合要求（纯函数）
 
     逻辑：
-    1. 文本框必须跨越图片的X轴中线（1080px图片的中线是X=540）
-    2. 理想情况：文本框在中轴线左右各占50%
-    3. 实际情况：OCR识别偏右，允许左右比例为40:60
+    1. 对于短文本（宽度<30%图片宽度）：使用宽松的中心点距离判断
+    2. 对于长文本：文本框必须跨越图片的X轴中线，且左右比例为40:60
 
-    即：文本框左侧占40%-60%，右侧占40%-60%
+    短文本宽松判断原因：
+    - 短文本如"董事长"（3个字）文本框较窄，容易不跨越中轴线
+    - 只需要文本中心点在合理范围内（±25%）即可
+
+    长文本严格判断原因：
+    - 长文本应该居中显示，跨越中轴线
+    - 左右比例40%-60%，允许OCR识别偏右
 
     Args:
         box_coords: 边界框坐标 [xmin, ymin, xmax, ymax]
         img_width: 图片宽度
-        tolerance_ratio: 左右偏移容忍度（默认0.1，即允许40%-60%的比例，废弃参数保留兼容）
+        tolerance_ratio: 左右偏移容忍度（保留兼容性）
 
     Returns:
         (is_valid, center_x, center_line, left_ratio) 元组
         - is_valid: 是否通过X轴过滤
         - center_x: 文本框中心X坐标
         - center_line: 图片中轴线X坐标
-        - left_ratio: 文本框左侧部分占比
+        - left_ratio: 文本框左侧部分占比（短文本时为0.5）
     """
     x1, y1, x2, y2 = box_coords
     center_line = img_width / 2  # 中轴线
     center_x = (x1 + x2) / 2  # 文本框中心
+    width = x2 - x1
 
+    if width <= 0:
+        return False, center_x, center_line, 0.0
+
+    # 对短文本使用宽松的判断（宽度 < 30% 图片宽度）
+    if width < img_width * 0.3:
+        # 短文本：只需要中心点在合理范围内（±25%，即中间50%区域）
+        tolerance = img_width * 0.25
+        is_valid = abs(center_x - center_line) < tolerance
+        # 返回0.5作为left_ratio，表示使用了宽松判断
+        return is_valid, center_x, center_line, 0.5
+
+    # 对长文本使用严格的跨越中轴线判断
     # 检查文本框是否跨越中轴线
     crosses_center = x1 < center_line < x2
 
@@ -192,10 +210,6 @@ def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio:
         return False, center_x, center_line, 0.0
 
     # 计算文本框左右比例
-    width = x2 - x1
-    if width <= 0:
-        return False, center_x, center_line, 0.0
-
     left_part = center_line - x1  # 中轴线左侧的部分
     right_part = x2 - center_line  # 中轴线右侧的部分
 
@@ -363,7 +377,7 @@ class VideoSubtitleExtractor:
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
-            text_rec_score_thresh=0.7,      # 识别阈值，平衡敏感度和噪声过滤
+            text_rec_score_thresh=0.8,      # 识别阈值，平衡敏感度和噪声过滤
             text_det_box_thresh=0.5,        # 检测阈值，适中设置
             text_det_thresh=0.1,            # 像素阈值，适中敏感度
             text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
@@ -703,8 +717,9 @@ class VideoSubtitleExtractor:
 
         similarity = smart_chinese_similarity(current_segment['text'], text)
 
+        # 使用绝对值判断时间间隔，处理可能的负值（时间重叠）或正值（时间间隔）
         is_time_continuous = abs(time_gap) < 0.001
-        is_short_gap = 0 < time_gap < merge_time_threshold
+        is_short_gap = abs(time_gap) < merge_time_threshold
         is_similar = similarity >= similarity_threshold
 
         return is_similar and (is_time_continuous or is_short_gap)
@@ -1046,8 +1061,11 @@ class VideoSubtitleExtractor:
                     curr_start_time = next_frame_idx / self.extract_fps + self.start_time
                     time_gap = curr_start_time - prev_end_time
 
-                    # 时间轴完全吻合（连续）或间隔很小
-                    if abs(time_gap) < 0.001:
+                    # 时间轴连续或间隔在合理范围内（1.5倍帧时长）
+                    # 15fps时，每帧约66.7ms，允许约100ms的间隔
+                    frame_duration = 1.0 / self.extract_fps
+                    max_gap = frame_duration * 1.5
+                    if abs(time_gap) < max_gap:
                         extended_end_frame = next_frame_idx
                         gap_filled_count += 1
                         next_frame_idx += 1
@@ -1543,16 +1561,41 @@ class VideoSubtitleExtractor:
         sorted_by_confidence = sorted(text_variants, key=lambda x: x.get('confidence', 0.0), reverse=True)
         highest_confidence = sorted_by_confidence[0].get('confidence', 0.0)
 
-        # 如果最高置信度明显高于其他（差距>0.1），直接选择
+        # 如果最高置信度明显高于其他（差距>0.1），且不是最短的，直接选择
         if len(sorted_by_confidence) > 1:
             second_confidence = sorted_by_confidence[1].get('confidence', 0.0)
             if highest_confidence - second_confidence > 0.1:
-                return sorted_by_confidence[0]['text']
+                # 额外检查：如果最高置信度的文本明显更短，可能不完整
+                # 在这种情况下，考虑次高置信度的更长文本
+                highest_text = sorted_by_confidence[0]['text']
+                second_text = sorted_by_confidence[1]['text']
+                # 如果最高置信度文本明显短于第二名（少30%以上），选择第二名
+                if len(highest_text) > 0 and len(second_text) > len(highest_text) * 1.3:
+                    # 差距不是特别大，且第二名更完整，选择第二名
+                    if highest_confidence - second_confidence < 0.15:
+                        return second_text
+                return highest_text
 
-        # 如果最高置信度的文本有多个，选择其中最长的
+        # 收集所有高置信度的文本（置信度在最高值的0.05范围内）
         high_confidence_variants = [v for v in text_variants if v.get('confidence', 0.0) >= highest_confidence - 0.05]
+
+        # 如果只有一个高置信度文本，直接返回
         if len(high_confidence_variants) == 1:
             return high_confidence_variants[0]['text']
+
+        # 如果有多个高置信度文本（置信度相近），优先选择最长的
+        # 这样可以避免选择不完整的文本（如"带" vs "带孩子"）
+        if len(high_confidence_variants) > 1:
+            # 先按置信度和长度综合排序
+            # 优先级：置信度>长度
+            best_variant = max(high_confidence_variants,
+                             key=lambda x: (x.get('confidence', 0.0), len(x['text'])))
+            # 检查是否有其他文本长度明显更长且置信度相近
+            for v in high_confidence_variants:
+                if (len(v['text']) > len(best_variant['text']) * 1.2 and
+                    v.get('confidence', 0.0) >= best_variant.get('confidence', 0.0) - 0.03):
+                    best_variant = v
+            return best_variant['text']
 
         # 转换为简体中文并去重（只处理高置信度的文本）
         normalized_variants = []
