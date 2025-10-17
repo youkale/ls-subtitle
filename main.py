@@ -236,6 +236,70 @@ def _normalize_box_coords(box) -> list:
         return [0, 0, 100, 30]
 
 
+def _is_valid_text_box_size(box_coords: list, img_width: int, img_height: int) -> tuple:
+    """
+    检查文本框尺寸是否在合理范围内（纯函数）
+
+    目的: 过滤掉异常大的文本框（如全屏误检测、背景元素）
+
+    正常字幕特征:
+    - 宽度: 5% - 85% 画面宽度
+    - 高度: 3% - 40% 画面高度（考虑不同分辨率和双行字幕）
+    - 面积: 不超过30% 画面面积
+
+    异常案例:
+    - 文本框 [116, 0, 1080, 480] 在 1080×480 画面中
+    - 占据89%宽度、100%高度 → 误检测
+
+    Args:
+        box_coords: 边界框坐标 [xmin, ymin, xmax, ymax]
+        img_width: 图片宽度
+        img_height: 图片高度
+
+    Returns:
+        (is_valid, width_ratio, height_ratio, area_ratio) 元组
+        - is_valid: 是否通过尺寸过滤
+        - width_ratio: 宽度占比
+        - height_ratio: 高度占比
+        - area_ratio: 面积占比
+    """
+    x1, y1, x2, y2 = box_coords
+
+    # 计算文本框尺寸
+    box_width = x2 - x1
+    box_height = y2 - y1
+    box_area = box_width * box_height
+
+    # 计算图片面积
+    img_area = img_width * img_height
+
+    # 计算比例
+    width_ratio = box_width / img_width if img_width > 0 else 0
+    height_ratio = box_height / img_height if img_height > 0 else 0
+    area_ratio = box_area / img_area if img_area > 0 else 0
+
+    # 尺寸阈值
+    max_width_ratio = 0.85    # 最大宽度：85%
+    max_height_ratio = 0.40   # 最大高度：40%（考虑不同分辨率和双行字幕）
+    max_area_ratio = 0.30     # 最大面积：30%（放宽以适应正常字幕）
+    min_width_ratio = 0.05    # 最小宽度：5%（过滤噪点）
+    min_height_ratio = 0.03   # 最小高度：3%（过滤噪点）
+
+    # 检查宽度
+    width_valid = min_width_ratio <= width_ratio <= max_width_ratio
+
+    # 检查高度
+    height_valid = min_height_ratio <= height_ratio <= max_height_ratio
+
+    # 检查面积
+    area_valid = area_ratio <= max_area_ratio
+
+    # 所有条件都满足才通过
+    is_valid = width_valid and height_valid and area_valid
+
+    return is_valid, width_ratio, height_ratio, area_ratio
+
+
 # ============ 文本相似度计算 ============
 
 def smart_chinese_similarity(text1: str, text2: str) -> float:
@@ -1477,7 +1541,7 @@ class VideoSubtitleExtractor:
                     self._process_ocr_texts(
                         rec_texts, rec_scores, boxes,
                         img_width, apply_x_filter,
-                        result_data, debug_print
+                        result_data, debug_print, img_height
                     )
 
             # 合并所有文本
@@ -1509,7 +1573,7 @@ class VideoSubtitleExtractor:
 
     def _process_ocr_texts(self, rec_texts: list, rec_scores: list, boxes: list,
                           img_width: int, apply_x_filter: bool,
-                          result_data: dict, debug_print: bool):
+                          result_data: dict, debug_print: bool, img_height: int = None):
         """处理OCR识别的文本列表"""
         for j, (text, score, box) in enumerate(zip(rec_texts, rec_scores, boxes)):
             if debug_print:
@@ -1522,6 +1586,25 @@ class VideoSubtitleExtractor:
 
             # 规范化边界框
             box_coords = _normalize_box_coords(box)
+
+            # 几何尺寸过滤（优先检查，过滤掉异常大的文本框）
+            if apply_x_filter and img_height:
+                size_valid, width_ratio, height_ratio, area_ratio = _is_valid_text_box_size(
+                    box_coords, img_width, img_height
+                )
+
+                if not size_valid:
+                    if debug_print:
+                        x1, y1, x2, y2 = box_coords
+                        box_width = x2 - x1
+                        box_height = y2 - y1
+                        print(f"    ✗ 跳过: 文本框尺寸异常")
+                        print(f"       文本框: [{x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f}]")
+                        print(f"       尺寸: {box_width:.0f}×{box_height:.0f}px")
+                        print(f"       宽度占比: {width_ratio:.1%} (限制: 5%-85%)")
+                        print(f"       高度占比: {height_ratio:.1%} (限制: 3%-40%)")
+                        print(f"       面积占比: {area_ratio:.1%} (限制: ≤30%)")
+                    continue
 
             # X轴中心点过滤
             if apply_x_filter:
