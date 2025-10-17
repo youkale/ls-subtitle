@@ -612,13 +612,14 @@ class VideoSubtitleExtractor:
 
         return results
 
-    def _print_merge_config(self, ocr_results: Dict[str, Dict], similarity_threshold: float, gap_time_threshold: float):
+    def _print_merge_config(self, ocr_results: Dict[str, Dict], similarity_threshold: float, gap_time_threshold: float, merge_time_threshold: float):
         """打印合并配置信息"""
         print(f"\n{'='*60}")
         print(f"智能字幕合并算法")
         print(f"{'='*60}")
         print(f"配置参数:")
         print(f"  - 相似度阈值: {similarity_threshold}")
+        print(f"  - 段落合并时间阈值: {merge_time_threshold}秒（{int(merge_time_threshold * 1000)}毫秒）")
         print(f"  - 间隙填充阈值: {gap_time_threshold}秒")
         print(f"  - 输入帧数: {len(ocr_results)} 帧")
 
@@ -682,8 +683,20 @@ class VideoSubtitleExtractor:
         return filtered_frames
 
     def _should_merge_segments(self, current_segment: Dict, frame_idx: int,
-                               text: str, similarity_threshold: float) -> bool:
-        """判断是否应该合并段落"""
+                               text: str, similarity_threshold: float, merge_time_threshold: float) -> bool:
+        """
+        判断是否应该合并段落
+
+        Args:
+            current_segment: 当前段落
+            frame_idx: 新帧的索引
+            text: 新帧的文本
+            similarity_threshold: 相似度阈值
+            merge_time_threshold: 时间间隔阈值（秒）
+
+        Returns:
+            是否应该合并
+        """
         current_end_time = (current_segment['end_frame'] + 1) / self.extract_fps + self.start_time
         new_start_time = frame_idx / self.extract_fps + self.start_time
         time_gap = new_start_time - current_end_time
@@ -691,14 +704,24 @@ class VideoSubtitleExtractor:
         similarity = smart_chinese_similarity(current_segment['text'], text)
 
         is_time_continuous = abs(time_gap) < 0.001
-        is_short_gap = 0 < time_gap < 0.15
+        is_short_gap = 0 < time_gap < merge_time_threshold
         is_similar = similarity >= similarity_threshold
 
         return is_similar and (is_time_continuous or is_short_gap)
 
     def _merge_similar_segments(self, filtered_frames: List[Dict],
-                               similarity_threshold: float) -> List[Dict]:
-        """智能相似度合并（帧级别 + 段落级别）"""
+                               similarity_threshold: float, merge_time_threshold: float) -> List[Dict]:
+        """
+        智能相似度合并（帧级别 + 段落级别）
+
+        Args:
+            filtered_frames: 过滤后的帧列表
+            similarity_threshold: 相似度阈值
+            merge_time_threshold: 时间间隔阈值（秒）
+
+        Returns:
+            合并后的段落列表
+        """
         print(f"\n[步骤 2/3] 智能相似度合并")
         print(f"  - 2-4字短文本智能识别")
         print(f"  - 置信度优先选择")
@@ -727,7 +750,7 @@ class VideoSubtitleExtractor:
                 text_variants = [{'text': text, 'confidence': confidence}]
             else:
                 should_merge = self._should_merge_segments(
-                    current_segment, frame_idx, text, similarity_threshold
+                    current_segment, frame_idx, text, similarity_threshold, merge_time_threshold
                 )
 
                 if should_merge:
@@ -745,7 +768,7 @@ class VideoSubtitleExtractor:
                         # 检查与最后一个段落的相似度和时间连续性
                         should_merge_with_last = self._should_merge_segments(
                             last_segment, current_segment['start_frame'],
-                            current_segment['text'], similarity_threshold
+                            current_segment['text'], similarity_threshold, merge_time_threshold
                         )
 
                         if should_merge_with_last:
@@ -784,7 +807,7 @@ class VideoSubtitleExtractor:
                 last_segment = merged_segments[-1]
                 should_merge_with_last = self._should_merge_segments(
                     last_segment, current_segment['start_frame'],
-                    current_segment['text'], similarity_threshold
+                    current_segment['text'], similarity_threshold, merge_time_threshold
                 )
 
                 if should_merge_with_last:
@@ -825,7 +848,7 @@ class VideoSubtitleExtractor:
         print(f"  - 整体压缩率: {(1 - len(final_segments) / len(ocr_results)) * 100:.1f}%")
         print(f"{'='*60}\n")
 
-    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, gap_time_threshold: float = 2.0) -> List[Dict]:
+    def merge_subtitle_segments(self, ocr_results: Dict[str, Dict], similarity_threshold: float = 0.8, gap_time_threshold: float = 2.0, merge_time_threshold: float = 0.3) -> List[Dict]:
         """
         智能合并字幕段（重构版）
 
@@ -843,6 +866,7 @@ class VideoSubtitleExtractor:
             ocr_results: OCR识别结果字典，包含所有帧的识别信息
             similarity_threshold: 文本相似度阈值（0.0-1.0），默认0.8
             gap_time_threshold: 间隙填充的最大时间阈值（秒），默认2.0秒
+            merge_time_threshold: 段落合并的最大时间间隔（秒），默认0.3秒（300毫秒）
 
         Returns:
             合并后的字幕段列表
@@ -851,7 +875,7 @@ class VideoSubtitleExtractor:
             return []
 
         # 打印配置信息
-        self._print_merge_config(ocr_results, similarity_threshold, gap_time_threshold)
+        self._print_merge_config(ocr_results, similarity_threshold, gap_time_threshold, merge_time_threshold)
 
         # 步骤1：预处理和X轴过滤
         filtered_frames = self._preprocess_ocr_frames(ocr_results)
@@ -864,7 +888,7 @@ class VideoSubtitleExtractor:
             return []
 
         # 步骤2：智能相似度合并
-        merged_segments = self._merge_similar_segments(filtered_frames, similarity_threshold)
+        merged_segments = self._merge_similar_segments(filtered_frames, similarity_threshold, merge_time_threshold)
         self._print_merge_stats(text_frames_count, merged_segments)
 
         # 步骤3：间隙填充
@@ -877,14 +901,14 @@ class VideoSubtitleExtractor:
         print(f"\n[步骤 4/4] 后处理合并")
         print(f"  - 合并相似且时间连续的段落")
         print(f"  - 去除标点符号差异")
-        final_segments = self._post_process_merge_segments(gap_filled_segments, similarity_threshold)
+        final_segments = self._post_process_merge_segments(gap_filled_segments, similarity_threshold, merge_time_threshold)
 
         # 打印最终统计
         self._print_final_stats(ocr_results, text_frames_count, final_segments)
 
         return final_segments
 
-    def _post_process_merge_segments(self, segments: List[Dict], similarity_threshold: float) -> List[Dict]:
+    def _post_process_merge_segments(self, segments: List[Dict], similarity_threshold: float, merge_time_threshold: float) -> List[Dict]:
         """
         后处理合并：合并间隙填充后相邻且相似的段落
 
@@ -892,12 +916,13 @@ class VideoSubtitleExtractor:
         这时需要检查它们是否应该合并。
 
         合并条件：
-        1. 段落时间连续或几乎连续（间隙 < 0.15秒）
+        1. 段落时间连续或几乎连续（间隙 < merge_time_threshold秒）
         2. 文本相似（去除标点后）
 
         Args:
             segments: 间隙填充后的段落列表
             similarity_threshold: 相似度阈值
+            merge_time_threshold: 时间间隔阈值（秒）
 
         Returns:
             后处理合并后的段落列表
@@ -927,7 +952,7 @@ class VideoSubtitleExtractor:
 
                 # 判断是否应该合并
                 # 时间必须连续或非常接近，且文本相似
-                is_time_continuous = abs(time_gap) < 0.15
+                is_time_continuous = abs(time_gap) < merge_time_threshold
                 is_similar = similarity >= similarity_threshold
                 should_merge = is_time_continuous and is_similar
 
