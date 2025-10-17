@@ -1006,13 +1006,22 @@ class VideoSubtitleExtractor:
         """
         填充段落之间的间隙 - 处理有识别区但无文字的帧
 
-        当检测到文本区域但没有识别出文字时，如果前一帧的结尾与当前帧的开头完全吻合，
-        则延续前一段的文字。
+        填充策略（保守安全）：
+        1. 只在时间轴完美连续时填充（前一帧结束=当前帧开始）
+        2. 累计填充时长不超过gap_time_threshold（默认2.0秒，限制最多0.5秒）
+        3. 考虑到下一段的距离，避免跨段填充
+
+        场景示例：
+          段落1: "弄死她" @ 02:01,333 --> 02:02,233
+          帧X:   ""       @ 02:02,233 --> 02:02,533  (有检测区但无文字)
+          段落2: "弄死她" @ 02:02,533 --> 02:03,533
+
+          → 时间完美连续，填充 ✓
 
         Args:
             merged_segments: 已合并的字幕段列表
             filtered_frames: 所有经过预处理的帧数据列表
-            gap_time_threshold: 间隙填充的最大时间阈值（秒）
+            gap_time_threshold: 累计填充的最大时间阈值（秒），默认2.0秒，实际限制为0.5秒
 
         Returns:
             填充间隙后的字幕段列表，包含时间戳
@@ -1023,9 +1032,14 @@ class VideoSubtitleExtractor:
         # 创建帧索引到帧数据的映射
         frame_map = {f['frame_index']: f for f in filtered_frames}
 
+        # 设置累计填充的最大时长（取较小值，最多0.5秒）
+        max_cumulative_fill_time = min(gap_time_threshold, 0.5)
+        frame_duration = 1.0 / self.extract_fps
+
         # 扩展段落以填充间隙
         extended_segments = []
         gap_filled_count = 0
+        segments_with_fill = 0
 
         for seg_idx, segment in enumerate(merged_segments):
             start_frame = segment['start_frame']
@@ -1034,14 +1048,21 @@ class VideoSubtitleExtractor:
 
             # 尝试向后扩展（填充后续有检测区但无文字的帧）
             extended_end_frame = end_frame
+            cumulative_fill_time = 0.0  # 累计填充时长
+            original_end_frame = end_frame
+
+            # 检查到下一段的总距离（如果不是最后一段）
+            next_segment_distance = float('inf')
+            if seg_idx < len(merged_segments) - 1:
+                next_segment_start = merged_segments[seg_idx + 1]['start_frame']
+                next_segment_distance = (next_segment_start - end_frame) * frame_duration
 
             # 检查后续帧
             next_frame_idx = end_frame + 1
             while True:
-                # 如果是最后一个段落，可以扩展到下一个有文字的帧之前
+                # 保护机制：不能扩展到下一个段落的开始位置
                 if seg_idx < len(merged_segments) - 1:
                     next_segment_start = merged_segments[seg_idx + 1]['start_frame']
-                    # 不能扩展到下一个段落的开始位置
                     if next_frame_idx >= next_segment_start:
                         break
 
@@ -1061,20 +1082,39 @@ class VideoSubtitleExtractor:
                     curr_start_time = next_frame_idx / self.extract_fps + self.start_time
                     time_gap = curr_start_time - prev_end_time
 
-                    # 时间轴连续或间隔在合理范围内（1.5倍帧时长）
-                    # 15fps时，每帧约66.7ms，允许约100ms的间隔
-                    frame_duration = 1.0 / self.extract_fps
-                    max_gap = frame_duration * 1.5
-                    if abs(time_gap) < max_gap:
-                        extended_end_frame = next_frame_idx
-                        gap_filled_count += 1
-                        next_frame_idx += 1
-                    else:
+                    # 关键检查1：时间轴必须完美连续（误差<1ms）
+                    # 如果时间不连续，说明字幕可能已经消失
+                    is_time_continuous = abs(time_gap) < 0.001
+
+                    if not is_time_continuous:
                         # 时间不连续，停止扩展
                         break
+
+                    # 关键检查2：累计填充时长不能超过限制
+                    fill_duration = frame_duration
+                    if cumulative_fill_time + fill_duration > max_cumulative_fill_time:
+                        # 累计填充时长超限，停止扩展
+                        break
+
+                    # 关键检查3：如果到下一段距离较远（>1秒），限制填充量
+                    # 避免在长时间间隔中过度填充
+                    if next_segment_distance > 1.0:
+                        max_fill_for_long_gap = 0.3  # 最多填充300ms
+                        if cumulative_fill_time + fill_duration > max_fill_for_long_gap:
+                            break
+
+                    # 通过所有检查，执行填充
+                    extended_end_frame = next_frame_idx
+                    cumulative_fill_time += fill_duration
+                    gap_filled_count += 1
+                    next_frame_idx += 1
                 else:
                     # 这一帧有文字或没有检测区，停止扩展
                     break
+
+            # 记录是否进行了扩展
+            if extended_end_frame > original_end_frame:
+                segments_with_fill += 1
 
             # 计算最终时间戳
             start_time = start_frame / self.extract_fps + self.start_time
@@ -1088,15 +1128,15 @@ class VideoSubtitleExtractor:
                 'end_frame': extended_end_frame
             })
 
+        # 打印统计信息
         print(f"  ✓ 间隙填充完成")
         if gap_filled_count > 0:
             print(f"    - 填充帧数: {gap_filled_count} 帧")
-            extended_count = sum(1 for i in range(len(extended_segments))
-                               if i < len(merged_segments) and
-                               extended_segments[i]['end_frame'] > merged_segments[i]['end_frame'])
-            print(f"    - 扩展段落: {extended_count} 个")
+            print(f"    - 扩展段落: {segments_with_fill} 个")
+            print(f"    - 累计填充限制: {int(max_cumulative_fill_time * 1000)}ms")
+            print(f"    - 时间连续性要求: 完美连接（<1ms）")
         else:
-            print(f"    - 无需填充")
+            print(f"    - 无需填充（所有段落时间不连续或文字完整）")
 
         return extended_segments
 
