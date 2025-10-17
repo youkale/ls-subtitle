@@ -243,20 +243,26 @@ def _normalize_box_coords(box) -> list:
         return [0, 0, 100, 30]
 
 
-def _is_valid_text_box_size(box_coords: list, img_width: int, img_height: int) -> tuple:
+def _is_valid_subtitle_position(box_coords: list, img_width: int, img_height: int) -> tuple:
     """
-    检查文本框尺寸是否在合理范围内（纯函数）
+    检查文本框是否符合字幕的几何特征（基于高度判断）
 
-    目的: 过滤掉异常大的文本框（如全屏误检测、背景元素）
+    核心思想：
+    - 字幕区域的高度有明显特征：通常占画面高度的15%-50%
+    - 过高或过低的文本框通常是装饰性文字或噪音
+    - 不限制边缘距离，因为不同视频的裁剪程度不同
 
-    正常字幕特征:
-    - 宽度: 5% - 95% 画面宽度（允许长字幕）
-    - 高度: 3% - 40% 画面高度（考虑不同分辨率和双行字幕）
-    - 面积: 不超过35% 画面面积（放宽以适应长字幕）
+    判断标准：
+    - 高度比例：字幕区域高度应该在15%-50%之间
+      - height_ratio ∈ [0.15, 0.50]
+      - 低于15%：可能是单个字或噪音
+      - 高于50%：可能是装饰性大字或误检测
 
-    异常案例:
-    - 文本框 [116, 0, 1080, 480] 在 1080×480 画面中
-    - 占据89%宽度、100%高度 → 误检测
+    实际案例分析：
+    - ✓ 正常字幕 height=26.0% → 通过
+    - ✓ 接近边缘的字幕 y1=2.1%, height=47.1% → 通过（高度合理）
+    - ✗ 过高文字 height=79.2% → 高度过高，过滤
+    - ✗ 过低文字 height=10% → 高度过低，过滤
 
     Args:
         box_coords: 边界框坐标 [xmin, ymin, xmax, ymax]
@@ -264,47 +270,39 @@ def _is_valid_text_box_size(box_coords: list, img_width: int, img_height: int) -
         img_height: 图片高度
 
     Returns:
-        (is_valid, width_ratio, height_ratio, area_ratio) 元组
-        - is_valid: 是否通过尺寸过滤
-        - width_ratio: 宽度占比
+        (is_valid, y1_ratio, y2_ratio, height_ratio, reason) 元组
+        - is_valid: 是否通过几何过滤
+        - y1_ratio: 顶部位置占比
+        - y2_ratio: 底部位置占比
         - height_ratio: 高度占比
-        - area_ratio: 面积占比
+        - reason: 过滤原因（如果被过滤）
     """
     x1, y1, x2, y2 = box_coords
 
-    # 计算文本框尺寸
-    box_width = x2 - x1
+    # 计算Y轴位置和高度比例
+    y1_ratio = y1 / img_height if img_height > 0 else 0
+    y2_ratio = y2 / img_height if img_height > 0 else 0
     box_height = y2 - y1
-    box_area = box_width * box_height
-
-    # 计算图片面积
-    img_area = img_width * img_height
-
-    # 计算比例
-    width_ratio = box_width / img_width if img_width > 0 else 0
     height_ratio = box_height / img_height if img_height > 0 else 0
-    area_ratio = box_area / img_area if img_area > 0 else 0
 
-    # 尺寸阈值
-    max_width_ratio = 0.95    # 最大宽度：95%（允许长字幕）
-    max_height_ratio = 0.40   # 最大高度：40%（考虑不同分辨率和双行字幕）
-    max_area_ratio = 0.35     # 最大面积：35%（放宽以适应长字幕）
-    min_width_ratio = 0.05    # 最小宽度：5%（过滤噪点）
-    min_height_ratio = 0.03   # 最小高度：3%（过滤噪点）
+    # 判断标准：仅基于高度比例
+    # 字幕区域的典型高度：15%-50% 画面高度
+    min_height_ratio = 0.15  # 15% - 最小高度
+    max_height_ratio = 0.50  # 50% - 最大高度
+    is_height_in_range = min_height_ratio <= height_ratio <= max_height_ratio
 
-    # 检查宽度
-    width_valid = min_width_ratio <= width_ratio <= max_width_ratio
+    # 判断结果和原因
+    reason = ""
+    if not is_height_in_range:
+        if height_ratio < min_height_ratio:
+            reason = f"高度过低({height_ratio:.1%} < {min_height_ratio:.0%})"
+        else:
+            reason = f"高度过高({height_ratio:.1%} > {max_height_ratio:.0%})"
 
-    # 检查高度
-    height_valid = min_height_ratio <= height_ratio <= max_height_ratio
+    # 只要高度合理即可通过
+    is_valid = is_height_in_range
 
-    # 检查面积
-    area_valid = area_ratio <= max_area_ratio
-
-    # 所有条件都满足才通过
-    is_valid = width_valid and height_valid and area_valid
-
-    return is_valid, width_ratio, height_ratio, area_ratio
+    return is_valid, y1_ratio, y2_ratio, height_ratio, reason
 
 
 # ============ 文本相似度计算 ============
@@ -1594,9 +1592,20 @@ class VideoSubtitleExtractor:
             # 规范化边界框
             box_coords = _normalize_box_coords(box)
 
-            # 尺寸过滤已移除，仅使用X轴过滤作为判断标准
-            # 原因：X轴过滤已经能有效判断是否为字幕区域
-            # 尺寸过滤容易误杀宽度较大的合法字幕（如长句子）
+            # Y轴位置过滤（几何过滤）：过滤非字幕区域的文字
+            if apply_x_filter and img_height:
+                position_valid, y1_ratio, y2_ratio, height_ratio, reason = _is_valid_subtitle_position(
+                    box_coords, img_width, img_height
+                )
+
+                if not position_valid:
+                    if debug_print:
+                        x1, y1, x2, y2 = box_coords
+                        print(f"    ✗ 跳过: Y轴位置过滤未通过")
+                        print(f"       文本框: [{x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f}]")
+                        print(f"       Y轴位置: 顶部{y1_ratio:.1%}, 底部{y2_ratio:.1%}, 高度{height_ratio:.1%}")
+                        print(f"       原因: {reason}")
+                    continue
 
             # X轴中心点过滤
             if apply_x_filter:
