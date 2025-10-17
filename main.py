@@ -163,7 +163,7 @@ def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio:
 
     逻辑：
     1. 对于短文本（宽度<30%图片宽度）：使用宽松的中心点距离判断
-    2. 对于长文本：文本框必须跨越图片的X轴中线，且左右比例为40:60
+    2. 对于长文本：文本框必须跨越图片的X轴中线，且左右比例为30:70
 
     短文本宽松判断原因：
     - 短文本如"董事长"（3个字）文本框较窄，容易不跨越中轴线
@@ -171,7 +171,7 @@ def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio:
 
     长文本严格判断原因：
     - 长文本应该居中显示，跨越中轴线
-    - 左右比例40%-60%，允许OCR识别偏右
+    - 左右比例30%-70%，允许OCR识别偏右
 
     Args:
         box_coords: 边界框坐标 [xmin, ymin, xmax, ymax]
@@ -216,11 +216,11 @@ def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio:
     left_ratio = left_part / width
     right_ratio = right_part / width
 
-    # 允许的比例范围：40%-60%
-    min_ratio = 0.4
-    max_ratio = 0.6
+    # 允许的比例范围：30%-70%
+    min_ratio = 0.3
+    max_ratio = 0.7
 
-    # 左侧和右侧都要在40%-60%范围内
+    # 左侧和右侧都要在30%-70%范围内
     is_valid = (min_ratio <= left_ratio <= max_ratio) and (min_ratio <= right_ratio <= max_ratio)
 
     return is_valid, center_x, center_line, left_ratio
@@ -1463,7 +1463,7 @@ class VideoSubtitleExtractor:
         # 添加说明文字
         cv2.putText(vis_img, 'X-axis Filter: Text box must cross center line', (10, img_height - 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(vis_img, 'with 40%-60% on each side', (10, img_height - 30),
+        cv2.putText(vis_img, 'with 30%-70% on each side', (10, img_height - 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # 添加图例
@@ -1622,7 +1622,7 @@ class VideoSubtitleExtractor:
                         print(f"       中轴线: X={center_line:.0f}")
                         print(f"       是否跨越中轴线: {crosses}")
                         if left_ratio > 0:
-                            print(f"       左右比例: {left_ratio:.1%} : {right_ratio:.1%} (要求: 40%-60%)")
+                            print(f"       左右比例: {left_ratio:.1%} : {right_ratio:.1%} (要求: 30%-70%)")
                     continue
 
             # 转换为简体中文并保存
