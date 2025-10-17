@@ -159,22 +159,57 @@ def _extract_ocr_data_from_item(item) -> tuple:
 
 def _is_text_in_center_region(box_coords: list, img_width: int, tolerance_ratio: float = 0.15) -> tuple:
     """
-    检查文本框是否在图片中心区域（纯函数）
+    检查文本框是否跨越中轴线且左右比例符合要求（纯函数）
+
+    逻辑：
+    1. 文本框必须跨越图片的X轴中线（1080px图片的中线是X=540）
+    2. 理想情况：文本框在中轴线左右各占50%
+    3. 实际情况：OCR识别偏右，允许左右比例为40:60
+
+    即：文本框左侧占40%-60%，右侧占40%-60%
 
     Args:
         box_coords: 边界框坐标 [xmin, ymin, xmax, ymax]
         img_width: 图片宽度
-        tolerance_ratio: 容忍度比例（默认15%）
+        tolerance_ratio: 左右偏移容忍度（默认0.1，即允许40%-60%的比例，废弃参数保留兼容）
 
     Returns:
-        (is_in_center, center_x, img_center_x, tolerance) 元组
+        (is_valid, center_x, center_line, left_ratio) 元组
+        - is_valid: 是否通过X轴过滤
+        - center_x: 文本框中心X坐标
+        - center_line: 图片中轴线X坐标
+        - left_ratio: 文本框左侧部分占比
     """
-    center_x = (box_coords[0] + box_coords[2]) / 2
-    img_center_x = img_width / 2
-    tolerance = img_width * tolerance_ratio
-    is_in_center = abs(center_x - img_center_x) <= tolerance
+    x1, y1, x2, y2 = box_coords
+    center_line = img_width / 2  # 中轴线
+    center_x = (x1 + x2) / 2  # 文本框中心
 
-    return is_in_center, center_x, img_center_x, tolerance
+    # 检查文本框是否跨越中轴线
+    crosses_center = x1 < center_line < x2
+
+    if not crosses_center:
+        # 不跨越中轴线，直接判定为不通过
+        return False, center_x, center_line, 0.0
+
+    # 计算文本框左右比例
+    width = x2 - x1
+    if width <= 0:
+        return False, center_x, center_line, 0.0
+
+    left_part = center_line - x1  # 中轴线左侧的部分
+    right_part = x2 - center_line  # 中轴线右侧的部分
+
+    left_ratio = left_part / width
+    right_ratio = right_part / width
+
+    # 允许的比例范围：40%-60%
+    min_ratio = 0.4
+    max_ratio = 0.6
+
+    # 左侧和右侧都要在40%-60%范围内
+    is_valid = (min_ratio <= left_ratio <= max_ratio) and (min_ratio <= right_ratio <= max_ratio)
+
+    return is_valid, center_x, center_line, left_ratio
 
 
 def _normalize_box_coords(box) -> list:
@@ -1267,17 +1302,36 @@ class VideoSubtitleExtractor:
                     cv2.putText(vis_img, label, (int(x1) + 2, text_y),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
+        # 绘制X轴中轴线参考线
+        img_height, img_width = vis_img.shape[:2]
+        center_line = img_width // 2  # X轴中轴线
+
+        # 绘制中轴线（红色实线）
+        cv2.line(vis_img, (center_line, 0), (center_line, img_height), (0, 0, 255), 3)
+
+        # 添加中轴线标注
+        cv2.putText(vis_img, f'Center Line X={center_line}', (center_line + 10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # 添加说明文字
+        cv2.putText(vis_img, 'X-axis Filter: Text box must cross center line', (10, img_height - 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(vis_img, 'with 40%-60% on each side', (10, img_height - 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
         # 添加图例
-        legend_y = 30
+        legend_y = 50
         cv2.putText(vis_img, 'Legend:', (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(vis_img, 'Blue: Detection Areas (dt_polys)', (10, legend_y + 25),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
         cv2.putText(vis_img, 'Green: Recognition Areas (rec_boxes)', (10, legend_y + 50),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        cv2.putText(vis_img, 'Red: Center Line (subtitle area)', (10, legend_y + 75),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         # 添加统计信息
         stats_text = f'Detected: {len(dt_polys)}, Recognized: {len(rec_boxes)}'
-        cv2.putText(vis_img, stats_text, (10, legend_y + 75),
+        cv2.putText(vis_img, stats_text, (10, legend_y + 100),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
         # 保存可视化结果
@@ -1388,14 +1442,21 @@ class VideoSubtitleExtractor:
 
             # X轴中心点过滤
             if apply_x_filter:
-                is_in_center, center_x, img_center_x, tolerance = _is_text_in_center_region(
+                is_valid, center_x, center_line, left_ratio = _is_text_in_center_region(
                     box_coords, img_width
                 )
 
-                if not is_in_center:
+                if not is_valid:
                     if debug_print:
-                        print(f"    ✗ 跳过: X轴偏离中心 (中心X={center_x:.1f}, "
-                              f"图片中心={img_center_x:.1f}, 容忍±{tolerance:.1f})")
+                        x1, y1, x2, y2 = box_coords
+                        right_ratio = 1 - left_ratio if left_ratio > 0 else 0
+                        crosses = "是" if x1 < center_line < x2 else "否"
+                        print(f"    ✗ 跳过: X轴过滤未通过")
+                        print(f"       文本框: [{x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f}]")
+                        print(f"       中轴线: X={center_line:.0f}")
+                        print(f"       是否跨越中轴线: {crosses}")
+                        if left_ratio > 0:
+                            print(f"       左右比例: {left_ratio:.1%} : {right_ratio:.1%} (要求: 40%-60%)")
                     continue
 
             # 转换为简体中文并保存
@@ -1411,8 +1472,15 @@ class VideoSubtitleExtractor:
             # 打印采用信息
             if debug_print:
                 if apply_x_filter:
-                    center_x = (box_coords[0] + box_coords[2]) / 2
-                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f}, 中心X={center_x:.1f})")
+                    x1, y1, x2, y2 = box_coords
+                    center_x = (x1 + x2) / 2
+                    width = x2 - x1
+                    center_line = img_width / 2
+                    left_part = center_line - x1
+                    left_ratio = left_part / width if width > 0 else 0
+                    right_ratio = 1 - left_ratio
+                    print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
+                    print(f"       文本框跨越中轴线, 左右比例: {left_ratio:.1%} : {right_ratio:.1%}")
                 else:
                     print(f"    ✓ 采用: \"{simplified_text}\" (置信度: {score:.3f})")
 
@@ -1768,14 +1836,18 @@ class VideoSubtitleExtractor:
             print(f"{'='*80}\n")
             raise
 
-    def ocr_single_image(self, image_path: str, save_result: bool = False, apply_x_filter: bool = True) -> Dict:
+    def ocr_single_image(self, image_path: str) -> Dict:
         """
         对单张图片进行OCR识别
 
+        默认会：
+        1. 保存OCR原始结果到JSON文件
+        2. 保存简单文本结果到TXT文件
+        3. 生成可视化图片（带检测框和识别结果）
+        4. 应用X轴中心点过滤（仅保留字幕区域文本）
+
         Args:
             image_path: 图片文件路径
-            save_result: 是否保存结果到文件
-            apply_x_filter: 是否应用X轴中心点过滤（默认True，过滤非字幕区域）
 
         Returns:
             OCR识别结果
@@ -1798,15 +1870,12 @@ class VideoSubtitleExtractor:
         print(f"图片尺寸: {width}x{height}")
 
         print("使用完整图片进行OCR识别")
-        if apply_x_filter:
-            print("✓ 已启用X轴中心点过滤（仅保留字幕区域文本）")
-        else:
-            print("⚠️  已禁用X轴中心点过滤（显示所有检测到的文本）")
+        print("✓ 已启用X轴中心点过滤（仅保留字幕区域文本）")
         ocr_img = img
 
-        # 使用抽象的核心OCR识别方法
+        # 使用抽象的核心OCR识别方法（默认启用X轴过滤）
         try:
-            core_result = self._ocr_image(ocr_img, debug_print=True, apply_x_filter=apply_x_filter, frame_path=str(image_path))
+            core_result = self._ocr_image(ocr_img, debug_print=True, apply_x_filter=True, frame_path=str(image_path))
 
             # 构建完整的结果数据
             result_data = {
@@ -1817,39 +1886,45 @@ class VideoSubtitleExtractor:
                 'raw_result': core_result['raw_result']
             }
 
-            # 保存结果到文件
-            if save_result:
-                # 获取PaddleOCR原始结果（不进行任何过滤）
-                raw_ocr_result = self.ocr.predict(ocr_img, use_textline_orientation=True)
+            # 默认保存结果到文件
+            # 获取PaddleOCR原始结果（不进行任何过滤）
+            raw_ocr_result = self.ocr.predict(ocr_img, use_textline_orientation=True)
 
-                result_file = image_path.parent / f"{image_path.stem}_ocr_result.json"
+            result_file = image_path.parent / f"{image_path.stem}_ocr_result.json"
 
-                # 创建可序列化的原始结果
-                save_data = {
-                    'image_path': str(image_path),
-                    'image_size': f"{ocr_img.shape[1]}x{ocr_img.shape[0]}",
-                    'paddleocr_raw_result': self._serialize_ocr_result(raw_ocr_result)
-                }
+            # 创建可序列化的原始结果
+            save_data = {
+                'image_path': str(image_path),
+                'image_size': f"{ocr_img.shape[1]}x{ocr_img.shape[0]}",
+                'paddleocr_raw_result': self._serialize_ocr_result(raw_ocr_result)
+            }
 
-                import json
-                with open(result_file, 'w', encoding='utf-8') as f:
-                    json.dump(save_data, f, ensure_ascii=False, indent=2)
+            import json
+            with open(result_file, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
 
-                print(f"PaddleOCR原始结果已保存到: {result_file}")
+            print(f"PaddleOCR原始结果已保存到: {result_file}")
 
-                # 同时保存简单的文本文件
-                text_file = image_path.parent / f"{image_path.stem}_ocr_result.txt"
-                with open(text_file, 'w', encoding='utf-8') as f:
-                    f.write(f"图片: {image_path}\n")
-                    f.write(f"尺寸: {result_data['image_size']}\n")
-                    f.write(f"裁剪: 否\n")
-                    f.write(f"识别文本数: {len(result_data['texts'])}\n\n")
-                    f.write(f"合并文本: {result_data['combined_text']}\n\n")
-                    f.write("详细结果:\n")
-                    for i, text_info in enumerate(result_data['texts'], 1):
-                        f.write(f"{i}. \"{text_info['simplified_text']}\" (置信度: {text_info['score']:.3f})\n")
+            # 同时保存简单的文本文件
+            text_file = image_path.parent / f"{image_path.stem}_ocr_result.txt"
+            with open(text_file, 'w', encoding='utf-8') as f:
+                f.write(f"图片: {image_path}\n")
+                f.write(f"尺寸: {result_data['image_size']}\n")
+                f.write(f"裁剪: 否\n")
+                f.write(f"识别文本数: {len(result_data['texts'])}\n\n")
+                f.write(f"合并文本: {result_data['combined_text']}\n\n")
+                f.write("详细结果:\n")
+                for i, text_info in enumerate(result_data['texts'], 1):
+                    f.write(f"{i}. \"{text_info['simplified_text']}\" (置信度: {text_info['score']:.3f})\n")
 
-                print(f"文本结果已保存到: {text_file}")
+            print(f"文本结果已保存到: {text_file}")
+
+            # 自动生成可视化图片
+            try:
+                vis_output = self.visualize_ocr_result(str(result_file))
+                print(f"可视化结果已保存到: {vis_output}")
+            except Exception as e:
+                print(f"⚠️  可视化生成失败: {e}")
 
             return result_data
 
@@ -1929,16 +2004,6 @@ def main():
         action='store_true',
         help='输出未合并的原始OCR结果到 *_raw.srt 文件（用于调试）'
     )
-    parser.add_argument(
-        '--save-result',
-        action='store_true',
-        help='单图OCR模式：保存PaddleOCR原始结果到JSON文件（不进行任何过滤）'
-    )
-    parser.add_argument(
-        '--no-x-filter',
-        action='store_true',
-        help='单图OCR模式：禁用X轴中心点过滤（显示所有检测到的文本）'
-    )
 
     args = parser.parse_args()
 
@@ -1969,12 +2034,8 @@ def main():
         print("=" * 50)
 
         try:
-            # 执行单图OCR
-            result = extractor.ocr_single_image(
-                image_path=args.ocr_image,
-                save_result=args.save_result,
-                apply_x_filter=not args.no_x_filter  # 默认启用X轴过滤，除非用户指定 --no-x-filter
-            )
+            # 执行单图OCR（默认保存结果、生成可视化、应用X轴过滤）
+            result = extractor.ocr_single_image(image_path=args.ocr_image)
 
             print("\n" + "=" * 50)
             print("OCR识别完成")
