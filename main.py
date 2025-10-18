@@ -157,7 +157,7 @@ def _extract_ocr_data_from_item(item) -> tuple:
     return rec_texts, rec_scores, boxes
 
 
-def _is_text_in_center_region(box_coords: list, img_width: int, min_side_ratio: float = 0.25) -> tuple:
+def _is_text_in_center_region(box_coords: list, img_width: int, min_side_ratio: float = 0.3) -> tuple:
     """
     检查文本框是否在中心区域（简化对称算法）
 
