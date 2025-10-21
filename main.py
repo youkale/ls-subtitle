@@ -157,7 +157,7 @@ def _extract_ocr_data_from_item(item) -> tuple:
     return rec_texts, rec_scores, boxes
 
 
-def _is_text_in_center_region(box_coords: list, img_width: int, min_side_ratio: float = 0.3) -> tuple:
+def _is_text_in_center_region(box_coords: list, img_width: int, min_side_ratio: float = 0.25) -> tuple:
     """
     检查文本框是否在中心区域（简化对称算法）
 
@@ -443,13 +443,17 @@ class VideoSubtitleExtractor:
             device = 'cpu'
 
         # 使用 PP-OCRv5 模型，优化参数以提高识别效果
+        # 参数说明（可调整以优化box精确度）：
+        # - text_det_box_thresh: 检测框置信度阈值 (0.3-0.8)，越低越敏感
+        # - text_det_thresh: 像素级阈值 (0.2-0.5)，控制边界敏感度
+        # - text_det_unclip_ratio: 扩张系数 (1.5-4.0)，越小box越紧凑
         self.ocr = PaddleOCR(
             use_textline_orientation=True,  # 新版本推荐参数（原use_angle_cls）
             lang='ch',
             text_rec_score_thresh=0.8,      # 识别阈值，平衡敏感度和噪声过滤
-            text_det_box_thresh=0.6,        # 检测阈值，适中设置
-            text_det_thresh=0.1,            # 像素阈值，适中敏感度
-            text_det_unclip_ratio=2.5,      # 扩张系数，扩大文本检测区域
+            text_det_box_thresh=0.5,        # 检测阈值（降低以提高敏感度）
+            text_det_thresh=0.3,            # 像素阈值，适中敏感度
+            text_det_unclip_ratio=1.5,      # 扩张系数（降低以获得更精确的box）
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
             ocr_version='PP-OCRv5',
