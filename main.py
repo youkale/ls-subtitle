@@ -453,7 +453,7 @@ class VideoSubtitleExtractor:
             text_rec_score_thresh=0.8,      # 识别阈值，平衡敏感度和噪声过滤
             text_det_box_thresh=0.5,        # 检测阈值（降低以提高敏感度）
             text_det_thresh=0.3,            # 像素阈值，适中敏感度
-            text_det_unclip_ratio=1.5,      # 扩张系数（降低以获得更精确的box）
+            text_det_unclip_ratio=1.4,      # 扩张系数（降低以获得更精确的box）
             text_detection_model_name='PP-OCRv5_server_det',
             text_recognition_model_name='PP-OCRv5_server_rec',
             ocr_version='PP-OCRv5',
